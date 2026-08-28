@@ -1,0 +1,32 @@
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local environments and editor state
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Agent traces may contain source code or command output.
+.coding-agent/
+traces/
+
+# Benchmark and demo workspaces are generated from clean fixtures.
+.workspaces/
+
+# Local assignment brief; the public repository contains the implementation.
+/要求.pdf
