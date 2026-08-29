@@ -1,0 +1,11 @@
+I designed and implemented a lightweight coding agent from scratch, without
+using an agent framework. The model uses ordinary OpenAI-compatible tool
+calling, while my runtime owns conversation history, context budgeting,
+response validation, local file and shell tools, retries, cancellation, and
+finite termination rules. A key invariant is that every assistant tool call
+receives exactly one matching result before the next model request. I also
+added an independent verifier, so a model saying "done" is not treated as
+proof that the code is correct. For external evaluation, the same runtime can
+bridge to a Harbor-style container and export an ATIF trajectory. I tested the
+control flow with deterministic fake models and report benchmark results only
+when fixed acceptance checks pass.

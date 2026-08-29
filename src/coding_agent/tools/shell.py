@@ -33,7 +33,8 @@ _STREAM_TRUNCATION_MARKER = b"\n... [command stream truncated] ...\n"
 # every secret stored under an arbitrary name, so event logs must independently
 # avoid dumping the entire environment.
 _SENSITIVE_ENVIRONMENT_NAME = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTHORIZATION|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY)$",
+    r"(?:^|_)(?:API_KEY|AUTHORIZATION|TOKEN|SECRET|PASSWORD|PASSWD|"
+    r"PRIVATE_KEY|CREDENTIALS?)$",
     flags=re.IGNORECASE,
 )
 

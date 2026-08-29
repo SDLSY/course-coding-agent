@@ -23,6 +23,11 @@ from coding_agent.events import (
     EventSink,
     JsonlEventSink,
 )
+from coding_agent.verification import (
+    CommandVerifier,
+    VerificationCheck,
+    VerificationResult,
+)
 
 # Exit codes are intentionally small and stable so a benchmark harness can
 # distinguish task/runtime outcomes from malformed invocation.  Detailed run
@@ -32,6 +37,9 @@ EXIT_RUNTIME_FAILED = 1
 EXIT_USAGE = 2
 EXIT_LIMIT_REACHED = 3
 EXIT_CANCELLED = 130
+# This code is used only when the opt-in ``--verify`` path is requested.  The
+# default CLI path retains the historical four outcomes above.
+EXIT_VERIFICATION_FAILED = 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +106,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="trace_path",
         metavar="PATH",
         help="append a redacted local JSONL event trace",
+    )
+    parser.add_argument(
+        "--verify",
+        "--verify-command",
+        dest="verification_commands",
+        action="append",
+        metavar="COMMAND",
+        help=(
+            "trusted acceptance command to run after the agent finishes; "
+            "repeat the option for multiple checks"
+        ),
+    )
+    parser.add_argument(
+        "--verify-timeout",
+        dest="verification_timeout_seconds",
+        type=float,
+        metavar="SECONDS",
+        default=120.0,
+        help="timeout applied to each opt-in acceptance command",
+    )
+    parser.add_argument(
+        "--planning",
+        action="store_true",
+        help="expose the side-effect-free update_plan tool",
     )
 
     budget = parser.add_argument_group("finite runtime budgets")
@@ -190,7 +222,7 @@ def main(
             environ=os.environ if environ is None else environ,
         )
         event_sink = _build_event_sink(config)
-        runtime = _build_runtime(config, event_sink)
+        runtime = _build_runtime(config, event_sink, planning=arguments.planning)
     except (ConfigurationError, OSError) as exc:
         # Configuration errors are designed not to contain a credential.  For
         # an OSError, show only class and filename; arbitrary OS messages can
@@ -219,8 +251,20 @@ def main(
         print(f"runtime error: {safe_message}", file=sys.stderr)
         return EXIT_RUNTIME_FAILED
 
-    _print_result(result)
-    return _exit_code_for_result(result)
+    verification: VerificationResult | None = None
+    if arguments.verification_commands:
+        try:
+            verification = _run_verification(
+                config,
+                arguments.verification_commands,
+                timeout_seconds=arguments.verification_timeout_seconds,
+            )
+        except KeyboardInterrupt:
+            print("verification cancelled by user", file=sys.stderr)
+            return EXIT_CANCELLED
+
+    _print_result(result, verification=verification)
+    return _exit_code_for_result(result, verification=verification)
 
 
 def _build_event_sink(config: AgentConfig) -> EventSink:
@@ -233,7 +277,12 @@ def _build_event_sink(config: AgentConfig) -> EventSink:
     return CompositeEventSink(console, trace)
 
 
-def _build_runtime(config: AgentConfig, event_sink: EventSink) -> Any:
+def _build_runtime(
+    config: AgentConfig,
+    event_sink: EventSink,
+    *,
+    planning: bool = False,
+) -> Any:
     """Assemble concrete dependencies after CLI validation has succeeded.
 
     Imports stay local to preserve a narrow command-line boundary.  No API
@@ -245,7 +294,10 @@ def _build_runtime(config: AgentConfig, event_sink: EventSink) -> Any:
     from coding_agent.context import ContextBuilder
     from coding_agent.model import OpenAICompatibleModelClient
     from coding_agent.policy import AgentLimits
-    from coding_agent.tools.registry import build_default_registry
+    from coding_agent.tools.registry import (
+        build_default_registry,
+        build_planning_registry,
+    )
 
     model_client = OpenAICompatibleModelClient(
         model=config.model,
@@ -257,7 +309,8 @@ def _build_runtime(config: AgentConfig, event_sink: EventSink) -> Any:
     # such as MODEL_GATEWAY_CREDENTIAL, which no suffix-based sanitizer can
     # infer reliably.  Pass the exact name down to the shell boundary; passing
     # the secret value itself would create an unnecessary leak surface.
-    tool_registry = build_default_registry(
+    registry_builder = build_planning_registry if planning else build_default_registry
+    tool_registry = registry_builder(
         config.workspace,
         excluded_command_environment_names=(config.api_key_env,),
     )
@@ -278,7 +331,11 @@ def _build_runtime(config: AgentConfig, event_sink: EventSink) -> Any:
     )
 
 
-def _print_result(result: object) -> None:
+def _print_result(
+    result: object,
+    *,
+    verification: VerificationResult | None = None,
+) -> None:
     """Render final model text to stdout and deterministic metadata to stderr."""
 
     final_text = getattr(result, "final_text", None)
@@ -299,17 +356,80 @@ def _print_result(result: object) -> None:
         if value is not None:
             fields.append(f"{attribute}={value}")
     print("run summary: " + " ".join(fields), file=sys.stderr)
+    if verification is not None:
+        check_count = len(verification.checks)
+        passed_count = sum(item.passed for item in verification.checks)
+        print(
+            "verification summary: "
+            f"passed={verification.passed} checks={passed_count}/{check_count} "
+            f"reason={verification.reason} "
+            f"elapsed_seconds={verification.elapsed_seconds:.6f}",
+            file=sys.stderr,
+        )
+        for item in verification.checks:
+            print(
+                "verification check: "
+                f"name={item.check.name} passed={item.passed} "
+                f"exit_code={item.exit_code} timed_out={item.timed_out}",
+                file=sys.stderr,
+            )
 
 
-def _exit_code_for_result(result: object) -> int:
+def _exit_code_for_result(
+    result: object,
+    *,
+    verification: VerificationResult | None = None,
+) -> int:
     phase = _phase_text(result).lower()
     if phase == "completed":
+        if verification is not None and not verification.passed:
+            return EXIT_VERIFICATION_FAILED
         return EXIT_COMPLETED
     if phase in {"limit_reached", "limit-reached"}:
         return EXIT_LIMIT_REACHED
     if phase == "cancelled":
         return EXIT_CANCELLED
+    # A runtime failure/limit/cancellation remains the primary outcome.  A
+    # failed acceptance check gets its own code only after a normal completion;
+    # this prevents a verifier from hiding why the agent itself stopped.
     return EXIT_RUNTIME_FAILED
+
+
+def _run_verification(
+    config: AgentConfig,
+    commands: Sequence[str],
+    *,
+    timeout_seconds: float,
+) -> VerificationResult:
+    """Run trusted, fixed acceptance commands after the Runtime returns.
+
+    These commands are CLI configuration, not model-generated input.  They are
+    intentionally kept outside ``AgentRuntime`` so their output cannot alter
+    canonical history, model/tool counters, or the meaning of ``COMPLETED``.
+    Construction/validation failures become a structured failed result rather
+    than a traceback at the terminal boundary.
+    """
+
+    try:
+        checks = tuple(
+            VerificationCheck(
+                name=f"check-{index}",
+                command=command,
+                timeout_seconds=timeout_seconds,
+            )
+            for index, command in enumerate(commands, start=1)
+        )
+        return CommandVerifier(
+            config.workspace,
+            checks,
+            excluded_environment_names=(config.api_key_env,),
+        ).verify()
+    except Exception as exc:  # noqa: BLE001 - extension/config boundary
+        return VerificationResult(
+            passed=False,
+            reason="verification setup failed",
+            error=type(exc).__name__,
+        )
 
 
 def _phase_text(result: object) -> str:

@@ -20,6 +20,7 @@ test = [
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"
+coding-agent-benchmark = "coding_agent.benchmark:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -191,6 +191,43 @@ coding-agent \
 
 事件写入前会递归处理敏感字段，并替换当前模型 API key、Bearer 值和常见 key 模式。这是尽力而为的日志保护，不保证识别项目文件或命令输出中的所有秘密。Trace 用于审计控制流和排错，不是可重放的 checkpoint，也不能复现非确定性的模型输出和外部命令状态。
 
+## 独立验收与可选计划
+
+Runtime 的终态和任务正确性是两个不同问题。可以在 Agent 返回后指定一个或多个固定验收命令：
+
+```bash
+coding-agent \
+  --workspace ./example-project \
+  --provider deepseek \
+  --model "replace-with-model-id" \
+  --verify "python3 -m pytest -q" \
+  "修复失败测试"
+```
+
+`--verify`（也可写作 `--verify-command`）只接受运行者预先配置的命令。命令在 Runtime 结束后独立运行，不进入模型历史，也不计入 Agent 的模型/工具预算。报告会显示每个检查的退出码和 timeout；模型正常停止但检查失败时，CLI 返回专用退出码 `4`。没有指定 `--verify` 时，原有退出码和行为保持不变。验收命令同样运行在当前用户权限下，不能视为安全沙箱。
+
+`--planning` 是一个显式 opt-in 的 `update_plan` 工具。它只保存 1--8 步的内存快照，用于观察模型意图；计划全部标记为 `completed` 也不会自动终止 Runtime，更不能证明代码正确。默认仍只暴露六个 MVP 工具。
+
+## Harbor 外部适配
+
+核心包不依赖 Harbor。`coding_agent.harbor_adapter` 提供一个可选异步桥接：同步 `AgentRuntime` 在工作线程运行，`RemoteExecutionBackend` 将六个工具的操作通过异步环境接口发送到任务容器的 `/app` 工作区，模型请求仍在主机侧完成。适配器不向容器传递 API key，并可把 ATIF-v1.7 `trajectory.json` 和运行摘要原子写入 Harbor 日志目录。
+
+这是外部评测适配层，不是本地强隔离实现；需要 Harbor/Docker 的环境由评测方提供。当前主机没有安装这些依赖，因此默认测试不会启动容器。
+
+## 有界 Benchmark
+
+`coding-agent-benchmark` 是一个独立的 fixture-based 实验工具。Manifest 为每个任务声明干净 fixture、固定验收命令、Agent argv 和统一预算；每次运行复制新工作区，验收在 Agent 进程退出后单独执行，结果输出为统一 JSON。默认是无副作用的计划模式，只有显式 `--execute` 才会启动 Agent 命令：
+
+```bash
+coding-agent-benchmark --manifest benchmarks/example.json --dry-run
+coding-agent-benchmark --manifest benchmarks/example.json --execute --output result.json
+```
+
+它可以比较同一模型驱动的不同 Agent，但不是官方 leaderboard 成绩。Terminal-Bench 2.1 的后置实验只计划选取 8 个 coding-oriented 任务、每任务单次运行；公开套件共有 89 个任务，官方口径通常要求每任务至少 5 次，二者不能混称。
+
+需要让外部 Agent 使用模型服务时，不要把 key 写进 manifest。可以在该 Agent 项中写
+`"environment_from_host": ["DEEPSEEK_API_KEY"]`，运行时只按这个明确的变量名从当前进程读取值；报告只记录变量名，命令输出仍会脱敏。未列出的敏感宿主变量不会传入子进程。
+
 ## 测试
 
 默认测试完全使用临时工作区、Fake/Scripted Model 和伪造响应，不需要 API key，也不会调用真实模型服务：
@@ -211,6 +248,7 @@ python3 -m ruff format --check src tests
 | `1` | Runtime 或 Agent 进入失败状态 |
 | `2` | CLI 用法或启动配置错误 |
 | `3` | 达到模型轮数、工具调用数或运行时间预算 |
+| `4` | 仅在指定 `--verify` 且验收检查失败时返回 |
 | `130` | 用户通过 Ctrl-C 等方式取消 |
 
 最终回答写入 stdout；事件和运行摘要写入 stderr，便于脚本分别处理结果与诊断信息。

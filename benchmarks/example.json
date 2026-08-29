@@ -1,0 +1,41 @@
+{
+  "schema_version": "coding-agent-benchmark/v1",
+  "name": "offline-example",
+  "repetitions": 1,
+  "budget": {
+    "max_wall_time_seconds": 30,
+    "max_model_requests": 10,
+    "max_tool_calls": 40,
+    "max_total_tokens": 40000,
+    "output_char_limit": 12000
+  },
+  "tasks": [
+    {
+      "id": "run-fixture-tests",
+      "prompt": "Inspect the fixture and keep it passing; report what you checked.",
+      "fixture": "example_project",
+      "checks": [
+        {
+          "name": "pytest",
+          "command": "python3 -m pytest -q"
+        }
+      ],
+      "metadata": {
+        "kind": "offline-demo"
+      }
+    }
+  ],
+  "agents": [
+    {
+      "id": "noop-demo",
+      "command": [
+        "python3",
+        "-c",
+        "print('benchmark agent placeholder')"
+      ],
+      "metadata": {
+        "note": "Replace command with an explicitly configured agent for execution."
+      }
+    }
+  ]
+}

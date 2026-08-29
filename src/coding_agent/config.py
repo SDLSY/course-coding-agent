@@ -167,7 +167,7 @@ class AgentConfig:
         )
         resolved_key_env = _validate_environment_name(resolved_key_env)
         resolved_api_key = source_env.get(resolved_key_env)
-        if resolved_api_key is None or not resolved_api_key.strip():
+        if not isinstance(resolved_api_key, str) or not resolved_api_key.strip():
             # Mention only the variable name.  Including a partially supplied
             # value in an exception can leak it into terminal logs or JSONL.
             raise ConfigurationError(

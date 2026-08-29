@@ -377,3 +377,23 @@ def build_default_registry(
         )
     )
     return ToolRegistry(tools)
+
+
+def build_planning_registry(
+    workspace: str | os.PathLike[str],
+    *,
+    plan_store: Any | None = None,
+    command_environment: Mapping[str, str] | None = None,
+    excluded_command_environment_names: Iterable[str] = (),
+) -> ToolRegistry:
+    """Assemble the default tools plus the opt-in side-effect-free planner."""
+
+    from .planning import build_update_plan_tool
+
+    registry = build_default_registry(
+        workspace,
+        command_environment=command_environment,
+        excluded_command_environment_names=excluded_command_environment_names,
+    )
+    registry.register(build_update_plan_tool(plan_store))
+    return registry

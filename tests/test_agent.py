@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import coding_agent.agent as agent_module
 from coding_agent.agent import AgentRuntime
 from coding_agent.context import ContextBuilder, estimate_request_chars
 from coding_agent.errors import (
@@ -121,6 +122,56 @@ def test_tool_result_is_paired_before_the_next_model_request() -> None:
         "content": "observed:alpha",
         "metadata": {"value": "alpha"},
     }
+
+
+def test_wall_time_expiry_before_tool_execution_still_pairs_result() -> None:
+    call = ToolCall("late", "record_value", '{"value":"x"}')
+    model = ScriptedModel([ModelTurn(tool_calls=(call,))])
+    runtime = _runtime(model, registry=ToolRegistry([_value_tool()]))
+
+    def expire(*_args, **_kwargs):
+        raise agent_module._WallTimeExpired
+
+    runtime._execute_one_call = expire  # type: ignore[method-assign]
+    result = runtime.run("trigger deadline")
+
+    assert result.phase is RunPhase.LIMIT_REACHED
+    assert [message.role for message in result.history] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert result.history[-1].tool_call_id == "late"
+    assert '"error_code":"wall_time_exceeded"' in (result.history[-1].content or "")
+
+
+def test_backend_exception_still_pairs_current_and_remaining_calls() -> None:
+    calls = (
+        ToolCall("broken", "record_value", '{"value":"x"}'),
+        ToolCall("skipped", "record_value", '{"value":"y"}'),
+    )
+    model = ScriptedModel([ModelTurn(tool_calls=calls)])
+
+    class BrokenBackend(ToolRegistry):
+        def execute_call(self, call, *, timeout_seconds=None):
+            raise RuntimeError("backend failure")
+
+    result = _runtime(model, registry=BrokenBackend([_value_tool()])).run(
+        "trigger backend failure"
+    )
+
+    assert result.phase is RunPhase.FAILED
+    assert [message.role for message in result.history] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+    ]
+    assert result.history[-2].tool_call_id == "broken"
+    assert result.history[-1].tool_call_id == "skipped"
+    assert '"error_code":"tool_backend_error"' in (result.history[-2].content or "")
 
 
 def test_multiple_tool_calls_execute_serially_in_model_order() -> None:

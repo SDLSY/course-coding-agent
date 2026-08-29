@@ -39,7 +39,7 @@ from coding_agent.errors import (
 from coding_agent.events import EventSink, NullEventSink
 from coding_agent.model import ModelClient
 from coding_agent.policy import AgentLimits, RetryPolicy
-from coding_agent.tools.registry import ToolRegistry
+from coding_agent.tools.backend import ExecutionBackend
 from coding_agent.types import (
     Message,
     ModelTurn,
@@ -102,7 +102,7 @@ class AgentRuntime:
     def __init__(
         self,
         model_client: ModelClient,
-        tool_registry: ToolRegistry,
+        tool_registry: ExecutionBackend,
         context_builder: ContextBuilder,
         limits: AgentLimits | None = None,
         event_sink: EventSink | None = None,
@@ -110,6 +110,7 @@ class AgentRuntime:
         retry_policy: RetryPolicy | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         sleep: Callable[[float], None] = time.sleep,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise ValueError("system_prompt must be a non-empty string")
@@ -121,6 +122,9 @@ class AgentRuntime:
         self.retry_policy = retry_policy or RetryPolicy()
         self.system_prompt = system_prompt.strip()
         self._sleep = sleep
+        if cancel_check is not None and not callable(cancel_check):
+            raise TypeError("cancel_check must be callable when supplied")
+        self._cancel_check = cancel_check
 
     def run(self, task: str) -> RunResult:
         """Execute ``task`` until a documented terminal condition is reached.
@@ -159,6 +163,11 @@ class AgentRuntime:
 
         try:
             while not state.phase.is_terminal:
+                if self._cancel_requested():
+                    self._terminate(
+                        state, RunPhase.CANCELLED, "run cancellation requested"
+                    )
+                    break
                 limit_reason = self._pre_model_limit_reason(state)
                 if limit_reason is not None:
                     self._terminate(state, RunPhase.LIMIT_REACHED, limit_reason)
@@ -498,6 +507,19 @@ class AgentRuntime:
         results: list[ToolResult] = []
         state.tool_calls += len(calls)
         for index, call in enumerate(calls):
+            if self._cancel_requested():
+                results.extend(
+                    self._skipped_results(
+                        calls[index:],
+                        error_code="cancelled",
+                        content="Tool was skipped after run cancellation was requested.",
+                    )
+                )
+                self._record_tool_transaction(state, turn, results)
+                return (
+                    RunPhase.CANCELLED,
+                    "run cancellation requested during tool batch",
+                )
             if self._wall_time_exhausted(state):
                 results.extend(
                     self._skipped_results(
@@ -521,6 +543,50 @@ class AgentRuntime:
                     call,
                     timeout_seconds=self._require_remaining_time(state, deadline),
                 )
+            except _WallTimeExpired:
+                # The run deadline may expire between the pre-tool check and
+                # computing the timeout passed to a backend. Preserve the
+                # assistant/tool transaction even in that narrow race by
+                # recording skipped results for the current and remaining
+                # calls before entering the terminal limit state.
+                results.extend(
+                    self._skipped_results(
+                        calls[index:],
+                        error_code="wall_time_exceeded",
+                        content="Tool was skipped because the run wall-time budget expired.",
+                    )
+                )
+                self._record_tool_transaction(state, turn, results)
+                return RunPhase.LIMIT_REACHED, "wall time expired during tool batch"
+            except Exception as exc:  # noqa: BLE001 - backend extension boundary
+                # A third-party backend should honor ExecutionBackend's
+                # always-return contract, but a defensive envelope here keeps
+                # canonical history valid even when it raises unexpectedly.
+                # The current call's outcome is unknown; remaining calls are
+                # never attempted and receive explicit skipped results.
+                results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        ok=False,
+                        content="Tool backend raised an unexpected exception; outcome is unknown.",
+                        metadata={
+                            "error_kind": "backend_exception",
+                            "outcome_known": False,
+                            "exception_type": type(exc).__name__,
+                        },
+                        error_code="tool_backend_error",
+                    )
+                )
+                results.extend(
+                    self._skipped_results(
+                        calls[index + 1 :],
+                        error_code="tool_backend_error",
+                        content="Tool was skipped after the backend raised an exception.",
+                    )
+                )
+                self._record_tool_transaction(state, turn, results)
+                return RunPhase.FAILED, "tool backend raised an exception"
             except KeyboardInterrupt:
                 # The interrupted operation may already have changed local
                 # state.  We report an unknown outcome and never retry it.
@@ -662,6 +728,18 @@ class AgentRuntime:
             self.event_sink.emit(event_type, **data)
         except OSError:
             self._event_sink_failed = True
+
+    def _cancel_requested(self) -> bool:
+        """Return whether an injected host has requested cooperative cancel.
+
+        The callback is intentionally polled only at protocol boundaries and
+        between tools.  A local tool that is already running keeps its own
+        timeout/termination semantics; interrupting it from an arbitrary
+        thread would risk an unknown side effect.  The default ``None`` path
+        preserves the original Runtime behaviour exactly.
+        """
+
+        return bool(self._cancel_check and self._cancel_check())
 
 
 class _UsageAccumulator:

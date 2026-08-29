@@ -28,10 +28,10 @@
 
 ### 1.2 明确不做
 
-四天版本不实现：
+核心 Runtime 四天版本不实现：
 
 - Web UI 或复杂 TUI；
-- 多 Agent、规划器、Reviewer 角色或多模型路由；
+- 多 Agent、Reviewer 角色或多模型路由；规划能力只提供一个显式 opt-in、无副作用的 `update_plan` 观察工具，不参与正确性判断或终止决策；
 - RAG、向量数据库或跨会话长期记忆；
 - 流式模型响应和并行工具执行；
 - 通用 diff/patch 语言解析器；
@@ -40,6 +40,8 @@
 - Docker、容器或操作系统级强安全沙箱；
 - 对所有模型厂商、操作系统和编程语言的兼容承诺；
 - 自动证明修改正确。
+
+Harbor 外部适配器和 benchmark runner 属于核心 Runtime 之外的可选评测层。它们不改变上述单 Agent 控制循环，也不把 Docker/Harbor 变成默认安装依赖。
 
 ## 2. 题目合规映射
 
@@ -394,6 +396,8 @@ tool_result(call_id=B)
 
 ### 13.2 最小验收矩阵
 
+自动化验收已覆盖下列本地项目项（当前 `203 passed`）；真实模型和视频项仍保留为现场交付步骤。
+
 - [ ] 模型直接返回 final text，Runtime 进入 `COMPLETED`。
 - [ ] `read -> edit -> run test -> final` 完整链路正确。
 - [ ] 一次响应包含多个工具调用，执行顺序和 call ID 配对正确。
@@ -428,6 +432,8 @@ tool_result(call_id=B)
 视频不通过人为制造大量炫技功能证明项目价值，而应让评委清楚看到“模型决策 -> 本地工具 -> 结果回填 -> 下一轮”的真实闭环，并用少量代码画面说明历史、状态机、错误处理均由项目实现。
 
 ## 15. 四天实施计划
+
+实施记录：第 1--3 天的核心 Runtime、工具、上下文、终止和本地测试已完成；当前还完成了第 19 节列出的独立验收、ATIF、Harbor 桥接和 benchmark 代码。已在干净副本完成 wheel 安装、203 项测试、Ruff、格式检查和编译验证。真实 API 冒烟、Docker/Harbor 评测、视频录制和最终 zip 仍是交付前的现场步骤，本仓库默认不执行这些外部操作。
 
 ### 第 1 天：协议和主循环
 
@@ -477,14 +483,13 @@ tool_result(call_id=B)
 
 ## 17. 待确认事项
 
-- [ ] 项目正式名称和 Python 包名。
-- [ ] 使用的 API 服务、base URL、模型和普通客户端库。
-- [ ] 公开仓库使用 GitHub 还是 Gitee，以及仓库地址。
-- [ ] Python 最低版本；当前建议为 3.11。
-- [ ] `run_command` 是否增加逐次用户确认模式，还是只提供受信工作区模式。
-- [ ] 默认上下文字符预算、工具输出上限和运行预算。
-- [ ] 最终演示项目和真实编程任务。
-- [ ] 运行事件的终端表现形式和 JSONL 字段。
+- [x] 项目名称、Python 包名和公开 GitHub 仓库地址已确定并写入 README。
+- [x] DeepSeek/GLM/custom 共用 OpenAI-compatible 适配器；模型 ID 仍由运行者显式填写。
+- [x] Python 最低版本为 3.11；默认预算、事件字段和工具边界已固化并有测试。
+- [x] `run_command` 采用受信 workspace 模式，文档明确它不是强沙箱。
+- [ ] 撤销曾在对话中暴露的旧 API key，并在真实演示前生成新 key。
+- [ ] 选择最终演示仓库和任务，完成真实 API 冒烟与视频录制。
+- [ ] 若评测环境具备 Docker/Harbor，执行第 20 节的外部冒烟和 benchmark 子集。
 
 ## 18. Definition of Done
 
@@ -500,3 +505,47 @@ tool_result(call_id=B)
 - [ ] 仓库和完整 Git 历史不含任何凭据。
 - [ ] README、视频和 zip 满足题目格式与截止要求。
 - [ ] 本人能够解释每个模块、关键不变量、错误策略和明确限制。
+
+## 19. 已实现的 Runtime-first 扩展
+
+在 MVP 基础上，当前仓库增加了几项不改变核心控制流的可选能力：
+
+### 19.1 ExecutionBackend 与协作式取消
+
+`AgentRuntime` 只依赖 `ExecutionBackend` 的两个方法：返回模型工具 schema，以及对一个原始 `ToolCall` 返回一个完整 `ToolResult`。默认 `ToolRegistry` 继续在本机执行；外部环境可以实现同一契约而不复制 Runtime。`cancel_check` 只在模型请求前和工具之间轮询，正在运行的副作用工具仍由自己的 timeout 收尾，避免从其他线程强行打断并伪造结果。
+
+### 19.2 独立 Verifier
+
+`CommandVerifier` 接收运行者预先配置的固定命令，在 `AgentRuntime.run` 返回后于独立进程组执行。它不追加 history、不增加 model/tool 计数，也不把 `COMPLETED` 改写成新的 Runtime 状态。每个检查记录退出码、timeout、耗时和有界 stdout/stderr。CLI 的 `--verify` 是 opt-in；只有正常 `COMPLETED` 且检查失败时才返回退出码 4。命令仍继承当前用户权限，不是沙箱。
+
+### 19.3 可选计划工具
+
+`--planning` 才会注册 `update_plan`。工具以不可变 revision 保存 1--8 个步骤，更新要么整体成功要么不改变旧快照。它只用于观察模型的计划，不读写工作区，不运行命令；即使全部步骤是 `completed`，Runtime 仍必须等待模型 final text 或其他正常终止条件。
+
+### 19.4 ATIF 投影
+
+`atif.py` 从规范 `RunResult.history` 投影 Harbor-compatible `ATIF-v1.7`，严格检查 assistant call 与 tool result 的顺序、ID、名称。非法 arguments 不伪造为有效对象，而保留原始文本扩展字段。导出默认不包含 reasoning；写文件使用临时文件、`fsync` 和原子替换，并复用日志脱敏逻辑。原有 JSONL trace 格式保持不变。
+
+### 19.5 Harbor 外部适配
+
+`harbor_adapter.py` 不导入 Harbor 包，定义最小异步 `BaseEnvironment`/`BaseAgent` 协议。`HarborAgentAdapter` 把同步 Runtime 放在工作线程，`RemoteExecutionBackend` 将六个工具映射到容器 `/app` 并通过 `run_coroutine_threadsafe` 桥接环境的异步 `exec`。模型客户端和 API key 留在主机侧；容器只收到远程命令。`write_harbor_artifacts` 可在日志目录写 `trajectory.json` 和 `run.json`。真正的容器隔离、镜像和 Harbor 任务编排不在核心包内，需评测环境自行提供。
+
+### 19.6 有界 Benchmark
+
+`benchmark.py` 将任务 fixture、Agent argv、固定验收命令、重复次数和预算统一记录。每个 case 从干净副本开始，Agent 结束后才验收，输出 `coding-agent-benchmark/v1` JSON 报告并区分 `resolved`、`unresolved`、`agent_failed`、`timeout` 等状态。CLI 默认只规划，不启动外部进程；`--execute` 才执行。该工具用于同一模型的受控对比，不是官方 leaderboard 计算器。
+
+外部 Agent 如需模型凭据，可在 manifest 中使用 `environment_from_host` 只列出变量名。运行时按当前 case 精确复制这些变量，值不写入 manifest/report；没有显式列出的敏感宿主变量继续被过滤。
+
+## 20. 后续实验与交付检查
+
+以下步骤需要真实模型或 Docker/Harbor，当前默认测试不会执行：
+
+1. 撤销对话中曾暴露的旧 API key，并为每个模型生成新 key；只通过未入库环境变量提供。
+2. 在干净 clone 中用一个小型真实仓库完成 `read -> edit -> run test -> final` 演示，录屏前检查终端、trace、视频和 zip 中没有凭据。
+3. 若环境具备 Docker/Harbor，再运行 Harbor 冒烟；宿主 Runtime 使用同一模型配置，任务容器只提供 `/app` 环境。
+4. Terminal-Bench 2.1 仅做后置子集实验：GLM Flash、8 个 coding-oriented 官方任务、每任务单次运行。建议任务名为 `fix-git`、`cancel-async-tasks`、`kv-store-grpc`、`polyglot-c-py`、`headless-terminal`、`fix-code-vulnerability`、`build-cython-ext`、`write-compressor`。公开套件有 89 个任务，官方 leaderboard 通常要求每任务至少 5 次，本实验不宣称官方成绩。
+5. 最终提交 zip 只包含姓名命名的 `README.txt` 和不超过 2 分钟/200 MB 的 MP4；公开仓库保留完整提交历史，截止后不再推送。
+
+## 21. 面试英文介绍（不超过 1 分钟）
+
+> I designed and implemented a lightweight coding agent from scratch, without using an agent framework. The model uses ordinary OpenAI-compatible tool calling, while my runtime owns the conversation history, context budgeting, response validation, local file and shell tools, retries, cancellation, and finite termination rules. A key invariant is that every assistant tool call receives exactly one matching result before the next model request. I also added an optional independent verifier, so a model saying “done” is not treated as proof that the code is correct. For external evaluation, the same runtime can bridge to a Harbor-style container and export an ATIF trajectory. I tested the control flow with deterministic fake models and report benchmark results only when fixed acceptance checks pass.

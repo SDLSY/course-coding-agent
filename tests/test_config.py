@@ -145,6 +145,19 @@ def test_missing_key_error_and_repr_never_include_secret(tmp_path: Path) -> None
     assert config.redacted_summary()["api_key_env"] == "DEEPSEEK_API_KEY"
 
 
+def test_non_string_key_environment_value_is_a_configuration_error(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigurationError, match="DEEPSEEK_API_KEY"):
+        AgentConfig.from_sources(
+            task="task",
+            workspace=tmp_path,
+            provider="deepseek",
+            model="test-model",
+            environ={"DEEPSEEK_API_KEY": 123},  # type: ignore[dict-item]
+        )
+
+
 def test_dotenv_file_is_not_loaded_implicitly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
