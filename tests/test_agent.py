@@ -174,6 +174,27 @@ def test_backend_exception_still_pairs_current_and_remaining_calls() -> None:
     assert '"error_code":"tool_backend_error"' in (result.history[-2].content or "")
 
 
+def test_duplicate_tool_ids_in_one_model_turn_are_rejected_before_execution() -> None:
+    duplicate_calls = (
+        ToolCall("same", "record_value", '{"value":"first"}'),
+        ToolCall("same", "record_value", '{"value":"second"}'),
+    )
+    model = ScriptedModel([ModelTurn(tool_calls=duplicate_calls)])
+    observed: list[str] = []
+
+    result = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool(observed)]),
+        limits=AgentLimits(max_protocol_retries=0),
+    ).run("Reject duplicate call IDs.")
+
+    assert result.phase is RunPhase.FAILED
+    assert result.reason == "runtime error: ResponseProtocolError"
+    assert result.tool_calls == 0
+    assert observed == []
+    assert all(message.role != "assistant" for message in result.history)
+
+
 def test_multiple_tool_calls_execute_serially_in_model_order() -> None:
     observed: list[str] = []
     calls = (

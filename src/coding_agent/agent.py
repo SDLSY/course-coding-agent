@@ -459,6 +459,19 @@ class AgentRuntime:
                 "assistant response contains neither tool calls nor non-empty text"
             )
 
+        # The response normalizer normally rejects duplicates while it is
+        # converting the provider object.  Keep the invariant at the
+        # controller boundary too: injected model clients and future adapters
+        # can return a ``ModelTurn`` directly, and a duplicate ID in one
+        # assistant message would make result pairing ambiguous.
+        current_ids: set[str] = set()
+        for call in turn.tool_calls:
+            if call.id in current_ids:
+                raise ResponseProtocolError(
+                    f"model returned duplicate tool call id: {call.id!r}"
+                )
+            current_ids.add(call.id)
+
         used_ids = {
             call.id
             for message in history

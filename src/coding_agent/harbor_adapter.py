@@ -16,7 +16,6 @@ import base64
 import inspect
 import json
 import os
-import re
 import shlex
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -25,13 +24,11 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from coding_agent.atif import export_atif, write_atif
+from coding_agent.errors import ToolRequestError
 from coding_agent.events import redact
+from coding_agent.response_parser import parse_tool_arguments
+from coding_agent.tools.shell import is_sensitive_environment_name
 from coding_agent.types import ToolCall, ToolResult
-
-_SENSITIVE_ENV = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTHORIZATION|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY)$",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +39,16 @@ class EnvironmentExecResult:
     stderr: str = ""
     exit_code: int | None = 0
     timed_out: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stdout, str) or not isinstance(self.stderr, str):
+            raise TypeError("environment exec stdout/stderr must be strings")
+        if self.exit_code is not None and (
+            not isinstance(self.exit_code, int) or isinstance(self.exit_code, bool)
+        ):
+            raise TypeError("environment exec exit_code must be an integer or null")
+        if not isinstance(self.timed_out, bool):
+            raise TypeError("environment exec timed_out must be a bool")
 
 
 @runtime_checkable
@@ -126,22 +133,15 @@ class RemoteCommandBackend:
                 error_code="unknown_tool",
             )
         try:
-            arguments = json.loads(call.arguments_json)
-        except (json.JSONDecodeError, TypeError):
-            return ToolResult(
-                call_id=call.id,
-                name=call.name,
-                ok=False,
-                content="Tool arguments must be valid JSON.",
-                error_code="invalid_json",
-            )
-        if not isinstance(arguments, Mapping):
-            return ToolResult(
-                call_id=call.id,
-                name=call.name,
-                ok=False,
-                content="Tool arguments must be a JSON object.",
-                error_code="invalid_arguments",
+            # Keep the remote boundary on the same strict JSON contract as the
+            # local registry. Duplicate keys and non-standard numeric values
+            # must not change meaning when a tool moves into a container.
+            arguments = parse_tool_arguments(call)
+        except ToolRequestError as exc:
+            return self._error(
+                call,
+                getattr(exc, "error_code", "invalid_tool_request"),
+                str(exc),
             )
         if set(arguments) - {"command", "timeout_seconds"}:
             return ToolResult(
@@ -340,26 +340,33 @@ class RemoteExecutionBackend(RemoteCommandBackend):
         if call.name == "run_command":
             return super().execute_call(call, timeout_seconds=timeout_seconds)
         try:
-            args = json.loads(call.arguments_json)
-        except (json.JSONDecodeError, TypeError):
+            args = parse_tool_arguments(call)
+        except ToolRequestError as exc:
             return self._error(
-                call, "invalid_json", "Tool arguments must be valid JSON."
-            )
-        if not isinstance(args, Mapping):
-            return self._error(
-                call, "invalid_arguments", "Tool arguments must be an object."
+                call,
+                getattr(exc, "error_code", "invalid_tool_request"),
+                str(exc),
             )
         try:
             self._validate_arguments(call.name, args)
             command = self._command_for(call.name, args)
         except ValueError as exc:
             return self._error(call, "invalid_arguments", str(exc))
-        return self._execute_remote(call, command, timeout_seconds, None)
+        return self._execute_remote(
+            call,
+            command,
+            timeout_seconds,
+            None,
+            success_exit_codes=(0, 1) if call.name == "search_text" else (0,),
+        )
 
     def _command_for(self, name: str, args: Mapping[str, Any]) -> str:
         path = self._remote_path(args.get("path", "."))
         if name == "list_files":
-            return f"find {shlex.quote(path)} -maxdepth 1 -mindepth 1 -print"
+            # Match the local list_files contract: recurse through the tree,
+            # while find's default behaviour still avoids following directory
+            # symlinks. The root itself is omitted by -mindepth 1.
+            return f"find {shlex.quote(path)} -mindepth 1 -print"
         if name == "search_text":
             query = args.get("query")
             if not isinstance(query, str) or not query:
@@ -497,7 +504,13 @@ class RemoteExecutionBackend(RemoteCommandBackend):
                 raise ValueError("replace_in_file requires string new text")
 
     def _execute_remote(
-        self, call: ToolCall, command: str, timeout: float | None, requested: Any
+        self,
+        call: ToolCall,
+        command: str,
+        timeout: float | None,
+        requested: Any,
+        *,
+        success_exit_codes: Sequence[int] = (0,),
     ) -> ToolResult:
         if self._loop is None:
             return self._error(
@@ -530,7 +543,15 @@ class RemoteExecutionBackend(RemoteCommandBackend):
             )
         stdout = _bounded(result.stdout, 32_000)
         stderr = _bounded(result.stderr, 32_000)
-        succeeded = result.exit_code == 0 and not result.timed_out
+        succeeded = (
+            not result.timed_out
+            and result.exit_code in success_exit_codes
+            and result.exit_code is not None
+        )
+        no_matches = call.name == "search_text" and result.exit_code == 1
+        content = f"exit_code: {result.exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        if no_matches and not result.timed_out:
+            content = "No matches found.\n" + content
         return ToolResult(
             call_id=call.id,
             name=call.name,
@@ -538,11 +559,12 @@ class RemoteExecutionBackend(RemoteCommandBackend):
             # error (matching local tool semantics); ``run_command`` keeps
             # non-zero exits as observations in its parent implementation.
             ok=succeeded,
-            content=f"exit_code: {result.exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            content=content,
             metadata={
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
                 "truncated": stdout != result.stdout or stderr != result.stderr,
+                "no_matches": no_matches,
             },
             error_code=None if succeeded else "remote_command_failed",
         )
@@ -738,22 +760,55 @@ def sanitized_host_environment(
 
     source = os.environ if environment is None else environment
     return {
-        key: value for key, value in source.items() if not _SENSITIVE_ENV.search(key)
+        key: value
+        for key, value in source.items()
+        if not is_sensitive_environment_name(key)
     }
 
 
-def _normalise_exec_result(
-    raw: EnvironmentExecResult | Mapping[str, Any],
-) -> EnvironmentExecResult:
+def _normalise_exec_result(raw: Any) -> EnvironmentExecResult:
     if isinstance(raw, EnvironmentExecResult):
         return raw
-    if not isinstance(raw, Mapping):
-        raise TypeError("environment exec must return a result mapping")
+
+    if isinstance(raw, Mapping):
+        get = raw.get
+    else:
+        # Harbor's native ``ExecResult`` is an object with attributes rather
+        # than a mapping.  Accept both spellings used by compatible wrappers.
+        if raw is None:
+            raise TypeError("environment exec must return a result object")
+
+        def get(name: str, default: Any = None) -> Any:
+            return getattr(raw, name, default)
+
+    stdout = get("stdout", "")
+    stderr = get("stderr", "")
+    if stdout is None:
+        stdout = ""
+    if stderr is None:
+        stderr = ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if isinstance(raw, Mapping):
+        exit_code = raw.get(
+            "exit_code",
+            raw.get("return_code", raw.get("returncode", 0)),
+        )
+        timed_out = raw.get("timed_out", False)
+    else:
+        exit_code = getattr(raw, "exit_code", None)
+        if exit_code is None:
+            exit_code = getattr(raw, "return_code", None)
+        if exit_code is None:
+            exit_code = getattr(raw, "returncode", 0)
+        timed_out = getattr(raw, "timed_out", False)
     return EnvironmentExecResult(
-        stdout=str(raw.get("stdout", "")),
-        stderr=str(raw.get("stderr", "")),
-        exit_code=raw.get("exit_code", raw.get("returncode", 0)),
-        timed_out=bool(raw.get("timed_out", False)),
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=exit_code,
+        timed_out=timed_out,
     )
 
 
@@ -768,13 +823,30 @@ def _environment_exec(
     scheduled, so a signature mismatch cannot execute a command twice.
     """
 
-    try:
-        return environment.exec(command, timeout_seconds=timeout_seconds)
-    except TypeError as first_error:
+    # Harbor 0.22 uses ``timeout_sec``; a few compatible environments use
+    # ``timeout`` or the more descriptive ``timeout_seconds``.  Try aliases at
+    # call time, when Python can report a keyword-signature mismatch without
+    # scheduling a command.  The first accepted coroutine is returned exactly
+    # once, so a mismatch cannot execute the remote operation twice.
+    first_error: TypeError | None = None
+    for keyword in ("timeout_seconds", "timeout", "timeout_sec"):
         try:
-            return environment.exec(command, timeout=timeout_seconds)  # type: ignore[call-arg]
-        except TypeError:
-            raise first_error
+            result = environment.exec(  # type: ignore[call-arg]
+                command,
+                **{keyword: timeout_seconds},
+            )
+            if inspect.isawaitable(result):
+                return result
+
+            async def _completed(value: Any = result) -> Any:
+                return value
+
+            return _completed()
+        except TypeError as exc:
+            if first_error is None:
+                first_error = exc
+    assert first_error is not None
+    raise first_error
 
 
 def _json_safe_value(value: Any) -> Any:

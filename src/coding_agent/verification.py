@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import signal
 import subprocess
 import tempfile
@@ -31,15 +30,11 @@ from pathlib import Path
 from typing import Protocol
 
 from coding_agent.agent import RunResult
+from coding_agent.tools.shell import is_sensitive_environment_name
 
 DEFAULT_CHECK_TIMEOUT_SECONDS = 120.0
 DEFAULT_OUTPUT_CHAR_LIMIT = 12_000
 _TERMINATION_GRACE_SECONDS = 0.5
-_SENSITIVE_ENVIRONMENT_NAME = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTHORIZATION|TOKEN|SECRET|PASSWORD|PASSWD|"
-    r"PRIVATE_KEY|CREDENTIALS?)$",
-    flags=re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,12 +212,12 @@ class CommandVerifier:
         env = {
             key: value
             for key, value in os.environ.items()
-            if key not in excluded and not _SENSITIVE_ENVIRONMENT_NAME.search(key)
+            if key not in excluded and not is_sensitive_environment_name(key)
         }
         for key, value in (environment or {}).items():
             if not isinstance(key, str) or not key or "=" in key or "\x00" in key:
                 raise ValueError("environment names must be non-empty strings")
-            if key in excluded or _SENSITIVE_ENVIRONMENT_NAME.search(key):
+            if key in excluded or is_sensitive_environment_name(key):
                 raise ValueError(
                     "verification environment cannot contain credential-like names"
                 )

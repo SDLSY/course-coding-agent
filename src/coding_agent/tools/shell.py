@@ -29,12 +29,18 @@ _STREAM_TRUNCATION_MARKER = b"\n... [command stream truncated] ...\n"
 
 # Names are compared case-insensitively because Windows-style or
 # provider-specific casing sometimes appears even in POSIX environments.  The
-# pattern intentionally errs toward withholding credentials.  It cannot infer
-# every secret stored under an arbitrary name, so event logs must independently
-# avoid dumping the entire environment.
+# pattern intentionally errs toward withholding credentials.  The trailing
+# ``(?:$|_)`` also catches compound names such as ``AWS_SECRET_ACCESS_KEY`` and
+# ``PRIVATE_KEY_PATH``; a bare substring check would incorrectly classify names
+# such as ``TOKENIZERS_PARALLELISM``.  It cannot infer every secret stored under
+# an arbitrary name, so event logs must independently avoid dumping the entire
+# environment.
 _SENSITIVE_ENVIRONMENT_NAME = re.compile(
-    r"(?:^|_)(?:API_KEY|AUTHORIZATION|TOKEN|SECRET|PASSWORD|PASSWD|"
-    r"PRIVATE_KEY|CREDENTIALS?)$",
+    r"(?:^|_)(?:API[_-]?KEY|AUTHORIZATION|ACCESS[_-]?TOKEN|"
+    r"REFRESH[_-]?TOKEN|AUTH[_-]?TOKEN|TOKEN|SECRET(?:[_-]ACCESS[_-]?KEY)?|"
+    r"PASSWORD|PASSWD|PRIVATE[_-]?KEY|CREDENTIALS?|"
+    r"ACCESS[_-]?KEY(?:[_-]?ID)?|CLIENT[_-]?SECRET|SSH[_-]?KEY)"
+    r"(?:$|_)",
     flags=re.IGNORECASE,
 )
 

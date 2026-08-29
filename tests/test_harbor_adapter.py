@@ -11,6 +11,7 @@ from coding_agent.harbor_adapter import (
     HarborExecutionBackend,
     RemoteCommandBackend,
     RemoteExecutionBackend,
+    _normalise_exec_result,
     sanitized_host_environment,
     write_harbor_artifacts,
 )
@@ -61,6 +62,72 @@ def test_remote_backend_accepts_timeout_named_harbor_style() -> None:
         assert result.ok is True
 
     asyncio.run(scenario())
+
+
+def test_remote_backend_accepts_native_harbor_exec_signature_and_result() -> None:
+    """Exercise Harbor 0.22's ``timeout_sec``/``return_code`` contract.
+
+    The project deliberately avoids importing Harbor as a runtime dependency,
+    so this small stand-in is the compatibility contract we can test locally.
+    In particular, unsupported timeout keyword aliases must be rejected before
+    the coroutine body runs; otherwise a fallback could execute a mutating
+    command more than once.
+    """
+
+    class NativeExecResult:
+        def __init__(self) -> None:
+            self.stdout = "native stdout"
+            self.stderr = None
+            self.return_code = 0
+
+    class HarborEnvironment:
+        def __init__(self) -> None:
+            self.calls: list[
+                tuple[
+                    str, str | None, dict[str, str] | None, int | None, str | int | None
+                ]
+            ] = []
+
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+            user: str | int | None = None,
+        ) -> NativeExecResult:
+            self.calls.append((command, cwd, env, timeout_sec, user))
+            return NativeExecResult()
+
+    async def scenario() -> None:
+        environment = HarborEnvironment()
+        backend = RemoteCommandBackend(environment)
+        backend.bind_loop(asyncio.get_running_loop())
+        result = await asyncio.to_thread(
+            backend.execute_call,
+            ToolCall("native", "run_command", '{"command":"printf ok"}'),
+            timeout_seconds=7,
+        )
+
+        assert result.ok is True
+        assert result.metadata["exit_code"] == 0
+        assert "native stdout" in result.content
+        assert environment.calls == [("cd /app && printf ok", None, None, 7, None)]
+
+    asyncio.run(scenario())
+
+
+def test_normalise_exec_result_accepts_harbor_return_code_object() -> None:
+    class NativeExecResult:
+        stdout = b"out"
+        stderr = b"err"
+        return_code = 3
+
+    assert _normalise_exec_result(NativeExecResult()) == EnvironmentExecResult(
+        stdout="out",
+        stderr="err",
+        exit_code=3,
+    )
 
 
 def test_remote_backend_shell_quotes_configured_workspace_path() -> None:
@@ -118,6 +185,46 @@ def test_remote_execution_backend_exposes_six_tools_and_bridges_file_ops() -> No
         assert read.ok and write.ok
         assert environment.calls[0][0].startswith("cat -- /app/src/main.py")
         assert "os.replace" in environment.calls[1][0]
+
+    asyncio.run(scenario())
+
+
+def test_remote_search_no_match_is_a_successful_observation() -> None:
+    class NoMatchEnvironment:
+        async def exec(self, command: str, *, timeout_seconds=None):
+            assert command == "grep -R -n -F -- needle /app"
+            return {"stdout": "", "stderr": "", "exit_code": 1}
+
+    async def scenario() -> None:
+        backend = RemoteExecutionBackend(NoMatchEnvironment())
+        backend.bind_loop(asyncio.get_running_loop())
+        result = await asyncio.to_thread(
+            backend.execute_call,
+            ToolCall("search", "search_text", '{"query":"needle"}'),
+        )
+        assert result.ok is True
+        assert result.metadata["no_matches"] is True
+        assert "No matches found." in result.content
+
+    asyncio.run(scenario())
+
+
+def test_remote_list_files_uses_recursive_find() -> None:
+    class RecordingEnvironment:
+        async def exec(self, command: str, *, timeout_seconds=None):
+            self.command = command
+            return {"stdout": "", "stderr": "", "exit_code": 0}
+
+    async def scenario() -> None:
+        environment = RecordingEnvironment()
+        backend = RemoteExecutionBackend(environment)
+        backend.bind_loop(asyncio.get_running_loop())
+        result = await asyncio.to_thread(
+            backend.execute_call,
+            ToolCall("list", "list_files", '{"path":"src"}'),
+        )
+        assert result.ok is True
+        assert environment.command == "find /app/src -mindepth 1 -print"
 
     asyncio.run(scenario())
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from coding_agent.config import AgentConfig, ConfigurationError, Provider
@@ -22,6 +22,7 @@ from coding_agent.events import (
     ConsoleEventSink,
     EventSink,
     JsonlEventSink,
+    redact,
 )
 from coding_agent.verification import (
     CommandVerifier,
@@ -263,7 +264,7 @@ def main(
             print("verification cancelled by user", file=sys.stderr)
             return EXIT_CANCELLED
 
-    _print_result(result, verification=verification)
+    _print_result(result, verification=verification, secrets=(config.api_key,))
     return _exit_code_for_result(result, verification=verification)
 
 
@@ -335,17 +336,20 @@ def _print_result(
     result: object,
     *,
     verification: VerificationResult | None = None,
+    secrets: Iterable[str] = (),
 ) -> None:
     """Render final model text to stdout and deterministic metadata to stderr."""
 
     final_text = getattr(result, "final_text", None)
     if isinstance(final_text, str) and final_text:
-        print(final_text)
+        safe_text = redact(final_text, secrets=secrets)
+        print(safe_text if isinstance(safe_text, str) else str(safe_text))
 
     fields: list[str] = [f"phase={_phase_text(result)}"]
     reason = getattr(result, "reason", None)
     if reason:
-        fields.append(f"reason={reason}")
+        safe_reason = redact(str(reason), secrets=secrets)
+        fields.append(f"reason={safe_reason}")
     for attribute in (
         "model_turns",
         "model_requests",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -214,3 +215,24 @@ def test_cli_verifier_excludes_custom_api_key_environment_name(
     assert result.passed is True
     assert SYNTHETIC_CREDENTIAL not in result.checks[0].stdout
     assert "missing" in result.checks[0].stdout
+
+
+def test_cli_final_output_redacts_the_configured_api_key(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = SimpleNamespace(
+        final_text=f"The provider returned {SYNTHETIC_CREDENTIAL}.",
+        reason=f"diagnostic: {SYNTHETIC_CREDENTIAL}",
+        phase=RunPhase.COMPLETED,
+        model_turns=1,
+        model_requests=1,
+        tool_calls=0,
+        elapsed_seconds=0.01,
+    )
+
+    cli_module._print_result(result, secrets=(SYNTHETIC_CREDENTIAL,))
+
+    captured = capsys.readouterr()
+    assert SYNTHETIC_CREDENTIAL not in captured.out
+    assert SYNTHETIC_CREDENTIAL not in captured.err
+    assert captured.out.count("[REDACTED]") == 1

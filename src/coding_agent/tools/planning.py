@@ -214,7 +214,10 @@ def _validate_plan(plan: Sequence[PlanStep], explanation: str | None) -> None:
 def build_update_plan_tool(store: PlanStore | None = None) -> Tool:
     """Build the model-facing ``update_plan`` definition."""
 
-    plan_store = store or PlanStore()
+    # Test doubles and integrations may intentionally implement ``__bool__``
+    # as false (for example, an empty persistent store).  Presence, rather
+    # than truthiness, determines whether the caller supplied a store.
+    plan_store = store if store is not None else PlanStore()
 
     def handler(arguments: Mapping[str, Any]) -> ToolOutput:
         try:

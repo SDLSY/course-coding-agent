@@ -52,6 +52,23 @@ def test_planning_registry_exposes_schema_and_full_snapshot(tmp_path: Path) -> N
     assert result.metadata == {"revision": 1, "completed": False}
 
 
+def test_falsey_plan_store_is_preserved() -> None:
+    class FalseyStore(PlanStore):
+        def __bool__(self) -> bool:
+            return False
+
+    store = FalseyStore()
+    tool = build_update_plan_tool(store)
+    result = ToolRegistry([tool]).execute(
+        "falsey-store",
+        "update_plan",
+        {"plan": [{"step": "Keep the injected store", "status": "pending"}]},
+    )
+
+    assert result.ok
+    assert store.revision == 1
+
+
 def test_invalid_update_is_atomic_and_returns_structured_error() -> None:
     store = PlanStore()
     store.update([{"step": "Keep this", "status": "pending"}])

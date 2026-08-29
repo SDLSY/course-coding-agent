@@ -470,6 +470,31 @@ def test_run_command_sanitizes_parent_credentials_but_keeps_benign_values(
     assert SYNTHETIC_SECRET not in result.content
 
 
+def test_run_command_filters_common_aws_and_harbor_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SYNTHETIC_SECRET)
+    monkeypatch.setenv("HARBOR_TOKEN", SYNTHETIC_SECRET)
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    registry = build_default_registry(tmp_path)
+
+    result = invoke(
+        registry,
+        "run_command",
+        {
+            "command": (
+                'test -z "${AWS_SECRET_ACCESS_KEY+x}" && '
+                'test -z "${HARBOR_TOKEN+x}" && '
+                'test "$TOKENIZERS_PARALLELISM" = true'
+            )
+        },
+    )
+
+    assert result.ok
+    assert result.metadata["exit_code"] == 0
+
+
 def test_run_command_excludes_an_exact_custom_credential_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
