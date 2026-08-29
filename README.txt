@@ -1,4 +1,4 @@
-Git仓库地址：[待创建公开仓库后填写]
+Git仓库地址：https://github.com/SDLSY/course-coding-agent
 
 项目说明：本项目是一个不使用 Agent 框架的轻量编程智能体。它通过普通 OpenAI-compatible Chat Completions 与模型原生 tool calling 工作，自行实现对话历史、上下文裁剪、模型响应解析、本地工具执行、状态循环、重试、终止预算和错误处理。内置文件列表、文本搜索、分段读取、原子写入、唯一文本替换和有界命令执行六个工具。
 
