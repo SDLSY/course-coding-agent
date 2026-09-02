@@ -150,6 +150,44 @@ def test_rich_sink_renders_progress_result_and_redacts_secrets(
     assert secret not in rendered
 
 
+def test_rich_sink_wraps_complete_final_response(tmp_path: Path) -> None:
+    output = StringIO()
+    final_text = (
+        "这次修复以测试所定义的折扣行为作为需求规范（SDD），"
+        "先用失败测试暴露问题、再修改实现并以测试通过验证结果。"
+    )
+    sink = RichEventSink(
+        task="repair the fixture",
+        workspace=tmp_path,
+        model="offline-model",
+        max_model_turns=10,
+        max_tool_calls=30,
+        max_wall_time_seconds=120,
+        console=Console(
+            file=output,
+            force_terminal=False,
+            color_system=None,
+            width=70,
+        ),
+        auto_refresh=False,
+    )
+
+    sink.finish(
+        SimpleNamespace(
+            phase=RunPhase.COMPLETED,
+            reason="model returned a final response",
+            final_text=final_text,
+            model_turns=1,
+            model_requests=1,
+            tool_calls=0,
+            elapsed_seconds=0.1,
+        )
+    )
+
+    normalized = "".join(output.getvalue().split())
+    assert "".join(final_text.split()) in normalized
+
+
 def test_rich_sink_shows_failed_tools_and_can_close_twice(tmp_path: Path) -> None:
     output = StringIO()
     sink = RichEventSink(

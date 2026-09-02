@@ -358,7 +358,10 @@ class RichEventSink:
 
             assistant = Table.grid(expand=True, padding=(0, 1))
             assistant.add_column(width=3, justify="center")
-            assistant.add_column(ratio=1)
+            # Final responses must wrap inside the bounded dashboard column.
+            # Rich's default ellipsis overflow turns a long Markdown paragraph
+            # into one clipped line, which hides the actual conclusion.
+            assistant.add_column(ratio=1, overflow="fold")
             if self._final_text:
                 assistant.add_row(
                     Text("●", style="green"),
