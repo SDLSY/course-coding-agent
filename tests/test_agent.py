@@ -124,6 +124,34 @@ def test_tool_result_is_paired_before_the_next_model_request() -> None:
     }
 
 
+def test_follow_up_run_preserves_complete_conversation_history() -> None:
+    call = ToolCall("call-first", "record_value", '{"value":"alpha"}')
+    model = ScriptedModel(
+        [
+            ModelTurn(tool_calls=(call,), finish_reason="tool_calls"),
+            ModelTurn(text="Recorded alpha.", finish_reason="stop"),
+            ModelTurn(text="It was alpha.", finish_reason="stop"),
+        ]
+    )
+    runtime = _runtime(model, registry=ToolRegistry([_value_tool()]))
+
+    first = runtime.run("Record one value.")
+    second = runtime.run("Which value did you record?", history=first.history)
+
+    assert second.phase is RunPhase.COMPLETED
+    assert [message.role for message in model.calls[2].messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+    assert model.calls[2].messages[-2].content == "Recorded alpha."
+    assert model.calls[2].messages[-1].content == "Which value did you record?"
+    assert [message.role for message in second.history][-2:] == ["user", "assistant"]
+
+
 def test_wall_time_expiry_before_tool_execution_still_pairs_result() -> None:
     call = ToolCall("late", "record_value", '{"value":"x"}')
     model = ScriptedModel([ModelTurn(tool_calls=(call,))])

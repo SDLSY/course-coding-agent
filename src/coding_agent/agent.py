@@ -164,8 +164,18 @@ class AgentRuntime:
         self._last_result_signature: str | None = None
         self._no_progress_batches = 0
 
-    def run(self, task: str) -> RunResult:
+    def run(
+        self,
+        task: str,
+        *,
+        history: Sequence[Message] | None = None,
+    ) -> RunResult:
         """Execute ``task`` until a documented terminal condition is reached.
+
+        ``history`` may contain a completed earlier run. When supplied, the new
+        user task is appended to that canonical conversation instead of adding
+        another system message. Runtime counters and deadlines still start
+        fresh for every call.
 
         The outer exception boundary converts expected runtime failures and
         unexpected implementation failures into ``FAILED`` results so the CLI
@@ -179,12 +189,19 @@ class AgentRuntime:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("task must be a non-empty string")
 
-        state = RunState(
-            history=[
-                Message(role="system", content=self.system_prompt),
-                Message(role="user", content=task.strip()),
-            ]
-        )
+        if history is None:
+            initial_history = [Message(role="system", content=self.system_prompt)]
+        else:
+            if isinstance(history, (str, bytes)) or not isinstance(history, Sequence):
+                raise TypeError("history must be a sequence of Message objects")
+            initial_history = list(history)
+            if not initial_history:
+                raise ValueError("history must not be empty when supplied")
+            if any(not isinstance(message, Message) for message in initial_history):
+                raise TypeError("history must contain only Message objects")
+
+        initial_history.append(Message(role="user", content=task.strip()))
+        state = RunState(history=initial_history)
         final_text: str | None = None
         usage_total = _UsageAccumulator()
         # One absolute deadline is shared by model requests, retry delays, and

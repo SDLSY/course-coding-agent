@@ -1,11 +1,15 @@
-Git仓库地址：https://github.com/SDLSY/course-coding-agent
+Git 仓库：https://github.com/SDLSY/course-coding-agent
 
-项目说明：这是一个不使用 Agent 框架的轻量编程智能体。它通过 OpenAI-compatible Chat Completions 和原生 tool calling，自行管理对话历史、上下文裁剪、响应解析、工具注册、本地执行、重试、预算和终止状态；提供列文件、搜索、读取、写入、唯一替换和有界命令六个工具。
+【设计理念：把不可信的大模型变成可信的工具】
+大模型不是可信的执行者，而是建议的提供者：它可能乱改代码、谎报完成、原地打转。本项目不使用任何 Agent 框架，核心思想借鉴 SDD（规范先行）与 TDD（测试驱动），并按一条主线落地——先立规矩，再跑循环，最后验结果：
 
-运行环境：Python 3.11+、POSIX。安装：`python3 -m pip install -e .`。API key 只放环境变量，模型 ID 必须显式填写：`coding-agent --workspace <目录> --provider deepseek --model <模型ID> "修复失败测试并验证"`。GLM 默认读取 `ZAI_API_KEY`；自定义网关使用 `--provider custom --base-url <HTTPS地址> --key-env <变量名>`。
+1. 先立规矩（SDD / Design by Contract）
+- 交互契约：工具调用与结果必须成对返回，上下文裁剪以完整轮次为单位，绝不向接口发送残缺消息；
+- 修改契约：replace_in_file 要求旧文本恰好出现一次，防止整文件重写丢失代码；
+- 边界契约：文件工具解析真实路径限制在工作区内，命令设超时、限输出、过滤密钥变量。
 
-特色功能：保持 tool call/result 严格配对，按完整事务块裁剪上下文；模型、协议和超时有界恢复；文件路径防越界；命令限时、限输出并过滤密钥；终端和 JSONL trace 脱敏。`--verify` 可独立验收，`--planning` 可记录计划，benchmark 输出统一 JSON。`COMPLETED` 不等于代码已正确。
+2. 再跑循环（有限状态机）
+终态只有四种：正常完成、预算耗尽、不可恢复错误、用户取消。循环中比对工具调用签名，检测原地打转并提醒重新规划；最后一轮预留为纯文本回答。模型输出解析失败不中断循环，而是包装成带原因的工具结果回传，由模型自行修正。
 
-Harbor 入口为 `coding_agent.harbor_plugin:CourseCodingAgent`（需 Python 3.12+ 和 Harbor 0.22；安装：`python3 -m pip install -e ".[harbor]"`）；Runtime 在主机运行，六个工具转发到容器 `/app`，日志输出脱敏 ATIF。核心不依赖 Harbor/Docker，也不是强沙箱。
-
-测试：`python3 -m pytest`；静态检查：`python3 -m ruff check src tests`。
+3. 最后验结果（TDD / Red-Green）
+模型自称完成不代表正确。运行结束后可选 --verify 执行独立验收命令（如 pytest），只有测试从红变绿才算任务完成；错误处理区分瞬态重试与永久失败，快速暴露而非静默吞掉。全程事件与轨迹脱敏导出，可审查。

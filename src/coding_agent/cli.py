@@ -1,4 +1,4 @@
-"""Command-line boundary for configuring and running one coding-agent task.
+"""Command-line boundary for configuring and running coding-agent tasks.
 
 The CLI owns user-facing parsing, environment lookup and exit codes.  It does
 not own the agent loop.  Imports of the runtime and concrete tools are delayed
@@ -33,6 +33,7 @@ from coding_agent.events import (
     JsonlEventSink,
     redact,
 )
+from coding_agent.tui import RichEventSink, prompt_for_task
 from coding_agent.verification import (
     CommandVerifier,
     VerificationCheck,
@@ -121,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="trace_path",
         metavar="PATH",
         help="append a redacted local JSONL event trace",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="render an interactive Rich dashboard instead of event log lines",
     )
     parser.add_argument(
         "--verify",
@@ -254,7 +260,7 @@ def main(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> int:
-    """Run one task and return a process exit code.
+    """Run one task or a persistent interactive TUI session.
 
     ``environ`` is injectable for tests.  The mapping is passed through to the
     configuration layer unchanged; no dotenv parser or implicit provider SDK
@@ -263,12 +269,30 @@ def main(
 
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    source_env = os.environ if environ is None else environ
     if arguments.task is not None and arguments.task_option is not None:
         parser.error("provide the task either positionally or with --task, not both")
 
     explicit_task = (
         arguments.task_option if arguments.task_option is not None else arguments.task
     )
+    interactive_session = (
+        arguments.tui
+        and explicit_task is None
+        and "CODING_AGENT_TASK" not in source_env
+    )
+    if interactive_session:
+        try:
+            explicit_task = prompt_for_task()
+        except KeyboardInterrupt:
+            print("\ninteractive input cancelled", file=sys.stderr)
+            return EXIT_CANCELLED
+        except EOFError:
+            print("\nconfiguration error: task input is required", file=sys.stderr)
+            return EXIT_USAGE
+        if explicit_task.lower() in {"/exit", "/quit"}:
+            return EXIT_COMPLETED
+    tui_sink: RichEventSink | None = None
     try:
         config = AgentConfig.from_sources(
             task=explicit_task,
@@ -292,10 +316,8 @@ def main(
             convergence_remaining_turns=arguments.convergence_remaining_turns,
             max_repeated_tool_batches=arguments.max_repeated_tool_batches,
             max_no_progress_batches=arguments.max_no_progress_batches,
-            environ=os.environ if environ is None else environ,
+            environ=source_env,
         )
-        event_sink = _build_event_sink(config)
-        runtime = _build_runtime(config, event_sink, planning=arguments.planning)
     except (ConfigurationError, OSError) as exc:
         # Configuration errors are designed not to contain a credential.  For
         # an OSError, show only class and filename; arbitrary OS messages can
@@ -305,45 +327,109 @@ def main(
             detail = f"{type(exc).__name__}{location}"
         else:
             detail = str(exc)
-        print(f"configuration error: {detail}", file=sys.stderr)
+        if tui_sink is not None:
+            tui_sink.abort(f"Configuration error: {detail}")
+        else:
+            print(f"configuration error: {detail}", file=sys.stderr)
         return EXIT_USAGE
 
-    try:
-        result = runtime.run(config.task)
-    except KeyboardInterrupt:
-        # AgentRuntime normally converts cancellation into a RunResult.  This
-        # boundary remains as protection for interrupts during construction or
-        # terminal rendering.
-        print("run cancelled by user", file=sys.stderr)
-        return EXIT_CANCELLED
-    except CodingAgentError as exc:
-        # Expected domain failures should ordinarily become FAILED results.
-        # Keeping a boundary here prevents a future adapter regression from
-        # producing a Python traceback in a two-minute demonstration.
-        safe_message = str(exc).replace(config.api_key, "[REDACTED]")
-        print(f"runtime error: {safe_message}", file=sys.stderr)
-        return EXIT_RUNTIME_FAILED
-
-    verification: VerificationResult | None = None
-    if arguments.verification_commands:
+    current_task = config.task
+    conversation_history: Sequence[Any] | None = None
+    while True:
+        tui_sink = None
         try:
-            verification = _run_verification(
-                config,
-                arguments.verification_commands,
-                timeout_seconds=arguments.verification_timeout_seconds,
+            if arguments.tui:
+                tui_sink = RichEventSink(
+                    task=current_task,
+                    workspace=config.workspace,
+                    model=config.model,
+                    max_model_turns=config.max_model_turns,
+                    max_tool_calls=config.max_tool_calls,
+                    max_wall_time_seconds=config.max_wall_time_seconds,
+                    secrets=(config.api_key,),
+                    show_header=not interactive_session,
+                )
+            event_sink = _build_event_sink(config, terminal_sink=tui_sink)
+            runtime = _build_runtime(
+                config, event_sink, planning=arguments.planning
             )
+            if conversation_history is None:
+                result = runtime.run(current_task)
+            else:
+                result = runtime.run(current_task, history=conversation_history)
         except KeyboardInterrupt:
-            print("verification cancelled by user", file=sys.stderr)
+            # AgentRuntime normally converts cancellation into a RunResult. This
+            # boundary also protects construction and terminal rendering.
+            if tui_sink is not None:
+                tui_sink.abort("Run cancelled by user", cancelled=True)
+            else:
+                print("run cancelled by user", file=sys.stderr)
             return EXIT_CANCELLED
+        except (ConfigurationError, OSError) as exc:
+            if isinstance(exc, OSError):
+                location = f" ({exc.filename})" if exc.filename else ""
+                detail = f"{type(exc).__name__}{location}"
+            else:
+                detail = str(exc)
+            if tui_sink is not None:
+                tui_sink.abort(f"Configuration error: {detail}")
+            else:
+                print(f"configuration error: {detail}", file=sys.stderr)
+            return EXIT_USAGE
+        except CodingAgentError as exc:
+            safe_message = str(exc).replace(config.api_key, "[REDACTED]")
+            if tui_sink is not None:
+                tui_sink.abort(f"Runtime error: {safe_message}")
+            else:
+                print(f"runtime error: {safe_message}", file=sys.stderr)
+            return EXIT_RUNTIME_FAILED
 
-    _print_result(result, verification=verification, secrets=(config.api_key,))
-    return _exit_code_for_result(result, verification=verification)
+        verification: VerificationResult | None = None
+        if arguments.verification_commands and (
+            not interactive_session or result.tool_calls > 0
+        ):
+            if tui_sink is not None:
+                tui_sink.verification_started(len(arguments.verification_commands))
+            try:
+                verification = _run_verification(
+                    config,
+                    arguments.verification_commands,
+                    timeout_seconds=arguments.verification_timeout_seconds,
+                )
+            except KeyboardInterrupt:
+                if tui_sink is not None:
+                    tui_sink.abort("Verification cancelled by user", cancelled=True)
+                else:
+                    print("verification cancelled by user", file=sys.stderr)
+                return EXIT_CANCELLED
+
+        if tui_sink is not None:
+            tui_sink.finish(result, verification)
+        else:
+            _print_result(result, verification=verification, secrets=(config.api_key,))
+
+        exit_code = _exit_code_for_result(result, verification=verification)
+        if not interactive_session or result.phase.value != "completed":
+            return exit_code
+
+        conversation_history = result.history
+        try:
+            current_task = prompt_for_task(show_header=False)
+        except KeyboardInterrupt:
+            print("\ninteractive session cancelled", file=sys.stderr)
+            return EXIT_CANCELLED
+        except EOFError:
+            return EXIT_COMPLETED
+        if current_task.lower() in {"/exit", "/quit"}:
+            return EXIT_COMPLETED
 
 
-def _build_event_sink(config: AgentConfig) -> EventSink:
+def _build_event_sink(
+    config: AgentConfig, *, terminal_sink: EventSink | None = None
+) -> EventSink:
     """Create terminal output and, when requested, a redacted JSONL trace."""
 
-    console = ConsoleEventSink(secrets=(config.api_key,))
+    console = terminal_sink or ConsoleEventSink(secrets=(config.api_key,))
     if config.trace_path is None:
         return console
     trace = JsonlEventSink(config.trace_path, secrets=(config.api_key,))

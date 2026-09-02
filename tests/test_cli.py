@@ -86,6 +86,12 @@ def test_planning_flag_is_opt_in_and_adds_only_update_plan(tmp_path: Path) -> No
     assert len(planned.tool_registry.names) == len(ordinary.tool_registry.names) + 1
 
 
+def test_tui_flag_is_opt_in() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["task"]).tui is False
+    assert parser.parse_args(["--tui", "task"]).tui is True
+
+
 def test_verification_commands_are_repeatable_and_alias_is_supported() -> None:
     parser = build_parser()
     arguments = parser.parse_args(
@@ -189,6 +195,141 @@ def test_main_runs_optional_verifier_once_after_runtime(
     captured = capsys.readouterr()
     assert "verification summary: passed=True" in captured.err
     assert "finished" in captured.out
+
+
+def test_main_finishes_optional_tui_with_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Tui:
+        def __init__(self, **kwargs: object) -> None:
+            observed["constructor"] = kwargs
+
+        def emit(self, event_type: str, **data: object) -> None:
+            pass
+
+        def verification_started(self, check_count: int) -> None:
+            observed["verification_started"] = check_count
+
+        def finish(self, result: object, verification: object | None) -> None:
+            observed["result"] = result
+            observed["verification"] = verification
+
+        def abort(self, message: str, *, cancelled: bool = False) -> None:
+            observed["abort"] = (message, cancelled)
+
+    class Runtime:
+        def run(self, task: str) -> RunResult:
+            return RunResult(
+                phase=RunPhase.COMPLETED,
+                reason="model returned a final response",
+                final_text="finished",
+                model_turns=1,
+                model_requests=1,
+                tool_calls=0,
+                elapsed_seconds=0.01,
+                usage=None,
+                history=(),
+            )
+
+    monkeypatch.setattr(cli_module, "RichEventSink", Tui)
+    monkeypatch.setattr(
+        cli_module, "_build_runtime", lambda config, sink, **kwargs: Runtime()
+    )
+    code = cli_module.main(
+        [
+            "--provider",
+            "custom",
+            "--model",
+            "offline",
+            "--base-url",
+            "https://gateway.example/v1",
+            "--key-env",
+            "MODEL_GATEWAY_CREDENTIAL",
+            "--tui",
+            "--verify",
+            "true",
+            "task",
+        ],
+        environ={"MODEL_GATEWAY_CREDENTIAL": SYNTHETIC_CREDENTIAL},
+    )
+
+    assert code == EXIT_COMPLETED
+    assert observed["verification_started"] == 1
+    assert observed["verification"].passed is True
+    constructor = observed["constructor"]
+    assert isinstance(constructor, dict)
+    assert constructor["task"] == "task"
+    assert constructor["secrets"] == (SYNTHETIC_CREDENTIAL,)
+
+
+def test_interactive_tui_preserves_history_until_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompts = iter(["first task", "what changed?", "/exit"])
+    calls: list[tuple[str, object | None]] = []
+    prior_history = ("complete-first-run-history",)
+
+    class Tui:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def emit(self, event_type: str, **data: object) -> None:
+            pass
+
+        def finish(self, result: object, verification: object | None) -> None:
+            pass
+
+        def abort(self, message: str, *, cancelled: bool = False) -> None:
+            pass
+
+    class Runtime:
+        def run(self, task: str, *, history: object | None = None) -> RunResult:
+            calls.append((task, history))
+            run_history = prior_history if history is None else (*prior_history, "next")
+            return RunResult(
+                phase=RunPhase.COMPLETED,
+                reason="model returned a final response",
+                final_text="finished",
+                model_turns=1,
+                model_requests=1,
+                tool_calls=0,
+                elapsed_seconds=0.01,
+                usage=None,
+                history=run_history,  # type: ignore[arg-type]
+            )
+
+    monkeypatch.setattr(
+        cli_module,
+        "prompt_for_task",
+        lambda **kwargs: next(prompts),
+    )
+    monkeypatch.setattr(cli_module, "RichEventSink", Tui)
+    monkeypatch.setattr(
+        cli_module, "_build_runtime", lambda config, sink, **kwargs: Runtime()
+    )
+
+    code = cli_module.main(
+        [
+            "--provider",
+            "custom",
+            "--model",
+            "offline",
+            "--base-url",
+            "https://gateway.example/v1",
+            "--key-env",
+            "MODEL_GATEWAY_CREDENTIAL",
+            "--tui",
+        ],
+        environ={"MODEL_GATEWAY_CREDENTIAL": SYNTHETIC_CREDENTIAL},
+    )
+
+    assert code == EXIT_COMPLETED
+    assert calls == [
+        ("first task", None),
+        ("what changed?", prior_history),
+    ]
 
 
 def test_cli_verifier_excludes_custom_api_key_environment_name(
