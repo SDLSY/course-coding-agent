@@ -18,8 +18,9 @@ from coding_agent.cli import (
     _run_verification,
     build_parser,
 )
-from coding_agent.config import AgentConfig
+from coding_agent.config import AgentConfig, ConfigurationError
 from coding_agent.events import NullEventSink
+from coding_agent.model import ReasoningCapability
 from coding_agent.types import RunPhase
 
 SYNTHETIC_CREDENTIAL = "synthetic-cli-credential-for-tests-only"
@@ -236,3 +237,137 @@ def test_cli_final_output_redacts_the_configured_api_key(
     assert SYNTHETIC_CREDENTIAL not in captured.out
     assert SYNTHETIC_CREDENTIAL not in captured.err
     assert captured.out.count("[REDACTED]") == 1
+
+
+class _RecordingEventSink:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def emit(self, event_type: str, **data: object) -> None:
+        self.events.append((event_type, dict(data)))
+
+
+def _reasoning_config(
+    tmp_path: Path, *, parameter: str = "reasoning_effort"
+) -> AgentConfig:
+    return AgentConfig.from_sources(
+        task="inspect the workspace",
+        workspace=tmp_path,
+        provider="custom",
+        model="offline-test-model",
+        base_url="https://gateway.example/v1",
+        key_env="MODEL_GATEWAY_CREDENTIAL",
+        reasoning_effort="high",
+        reasoning_parameter=parameter,
+        environ={"MODEL_GATEWAY_CREDENTIAL": SYNTHETIC_CREDENTIAL},
+    )
+
+
+def test_cli_probes_custom_reasoning_field_and_applies_confirmed_value(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Model:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.reasoning_capability = None
+
+        def probe_reasoning_effort(
+            self,
+            effort: str,
+            *,
+            parameter_candidates: tuple[str, ...],
+            timeout_seconds: float,
+        ) -> ReasoningCapability:
+            calls.append(
+                {
+                    "effort": effort,
+                    "parameter_candidates": parameter_candidates,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            return ReasoningCapability(
+                status="supported",
+                requested_effort=effort,
+                parameter="thinking",
+                accepted_value="high",
+            )
+
+        def configure_reasoning(self, capability: ReasoningCapability) -> None:
+            self.reasoning_capability = capability
+
+    sink = _RecordingEventSink()
+    runtime = _build_runtime(
+        _reasoning_config(tmp_path, parameter="thinking"),
+        sink,
+        model_client_factory=Model,
+        reasoning_probe_timeout_seconds=7,
+    )
+
+    # The probe client is constructed without an unverified reasoning field;
+    # the confirmed capability is applied only after the probe succeeds.
+    assert "reasoning_effort" not in runtime.model_client.kwargs
+    assert "reasoning_parameter" not in runtime.model_client.kwargs
+    assert runtime.model_client.reasoning_capability.status == "supported"
+    assert calls == [
+        {
+            "effort": "high",
+            "parameter_candidates": ("thinking",),
+            "timeout_seconds": 7.0,
+        }
+    ]
+    assert sink.events[0][0] == "reasoning.probe"
+    assert sink.events[0][1]["parameter"] == "thinking"
+    assert sink.events[0][1]["accepted_value"] == "high"
+
+
+def test_cli_rejects_unsupported_reasoning_before_building_runtime(
+    tmp_path: Path,
+) -> None:
+    sink = _RecordingEventSink()
+
+    class Model:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def probe_reasoning_effort(self, effort: str, **kwargs: object):
+            return ReasoningCapability(
+                status="unsupported",
+                requested_effort=effort,
+                parameter="reasoning_effort",
+                detail=f"gateway rejected {SYNTHETIC_CREDENTIAL}",
+            )
+
+    with pytest.raises(ConfigurationError, match="unsupported"):
+        _build_runtime(
+            _reasoning_config(tmp_path),
+            sink,
+            model_client_factory=Model,
+        )
+
+    assert sink.events[0][1]["status"] == "unsupported"
+    assert SYNTHETIC_CREDENTIAL not in repr(sink.events)
+
+
+def test_cli_probe_errors_fail_closed_without_leaking_provider_detail(
+    tmp_path: Path,
+) -> None:
+    sink = _RecordingEventSink()
+
+    class Model:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def probe_reasoning_effort(self, effort: str, **kwargs: object):
+            raise RuntimeError(f"gateway response included {SYNTHETIC_CREDENTIAL}")
+
+    with pytest.raises(ConfigurationError, match="probe failed"):
+        _build_runtime(
+            _reasoning_config(tmp_path),
+            sink,
+            model_client_factory=Model,
+        )
+
+    assert sink.events[0][1]["status"] == "error"
+    assert SYNTHETIC_CREDENTIAL not in repr(sink.events)

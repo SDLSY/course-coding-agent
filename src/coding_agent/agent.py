@@ -19,8 +19,10 @@ providers would reject the entire conversation.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from coding_agent.context import (
@@ -38,7 +40,7 @@ from coding_agent.errors import (
 )
 from coding_agent.events import EventSink, NullEventSink
 from coding_agent.model import ModelClient
-from coding_agent.policy import AgentLimits, RetryPolicy
+from coding_agent.policy import AgentLimits, EfficiencyPolicy, RetryPolicy
 from coding_agent.tools.backend import ExecutionBackend
 from coding_agent.types import (
     Message,
@@ -52,16 +54,28 @@ from coding_agent.types import (
 
 DEFAULT_SYSTEM_PROMPT = """You are a coding agent operating on a user-selected local workspace.
 
-Use the provided tools to inspect the project, make focused changes, and run
-appropriate checks.  Treat every tool result as an observation, including
-non-zero command exits and structured tool errors.  Paths passed to file tools
-must be relative to the workspace.  Inspect relevant code before editing it,
-prefer small changes, and do not claim that a check passed unless its tool
-result says so.  When the task is complete or cannot be advanced responsibly,
-return a concise final response describing changes, checks, and any remaining
-limitations.  A final response stops the runtime; it is not itself proof that
-the code is correct.
+First form a short phase plan in your reasoning. Inspect the project, make
+focused changes, and run appropriate checks. When several reads, searches, or
+independent tests do not depend on one another, request them in one tool-call
+batch. Treat every tool result as an observation, including non-zero command
+exits and structured tool errors. Paths passed to file tools must be relative
+to the workspace. Do not claim that a check passed unless its tool result says
+so. When the task is complete or cannot be advanced responsibly, return a
+concise final response describing changes, checks, and remaining limitations.
+A final response stops the runtime; it is not itself proof that the code is
+correct.
 """
+
+_CONVERGENCE_REMINDER = (
+    "Converge now: stop repeated exploration, prioritize the smallest required "
+    "edits, run a focused verification, and return a final answer before the "
+    "turn budget is exhausted."
+)
+_REPLAN_REMINDER = (
+    "The recent tool calls made no measurable progress or repeated the same "
+    "request. Re-plan from the evidence already collected, choose a different "
+    "action, and avoid repeating that tool call."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +125,7 @@ class AgentRuntime:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         sleep: Callable[[float], None] = time.sleep,
         cancel_check: Callable[[], bool] | None = None,
+        efficiency_policy: EfficiencyPolicy | None = None,
     ) -> None:
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise ValueError("system_prompt must be a non-empty string")
@@ -118,6 +133,24 @@ class AgentRuntime:
         self.tool_registry = tool_registry
         self.context_builder = context_builder
         self.limits = limits or AgentLimits()
+        if efficiency_policy is not None and not isinstance(
+            efficiency_policy, EfficiencyPolicy
+        ):
+            raise TypeError("efficiency_policy must be an EfficiencyPolicy")
+        self.efficiency_policy = efficiency_policy or EfficiencyPolicy(
+            enabled=self.limits.efficiency_mode,
+            # Efficiency mode is a complete turn-management strategy: the
+            # convergence reminders are useful only when the controller also
+            # leaves one tool-free turn for the final response.  Keep the
+            # explicit reserve flag independently useful for callers that do
+            # not enable the other efficiency hints.
+            reserve_final_turn=(
+                self.limits.reserve_final_turn or self.limits.efficiency_mode
+            ),
+            convergence_remaining_turns=self.limits.convergence_remaining_turns,
+            max_repeated_tool_batches=self.limits.max_repeated_tool_batches,
+            max_no_progress_batches=self.limits.max_no_progress_batches,
+        )
         self.event_sink = event_sink or NullEventSink()
         self.retry_policy = retry_policy or RetryPolicy()
         self.system_prompt = system_prompt.strip()
@@ -125,6 +158,11 @@ class AgentRuntime:
         if cancel_check is not None and not callable(cancel_check):
             raise TypeError("cancel_check must be callable when supplied")
         self._cancel_check = cancel_check
+        self._pending_efficiency_reminder: str | None = None
+        self._last_tool_signature: str | None = None
+        self._repeated_tool_batches = 0
+        self._last_result_signature: str | None = None
+        self._no_progress_batches = 0
 
     def run(self, task: str) -> RunResult:
         """Execute ``task`` until a documented terminal condition is reached.
@@ -153,6 +191,11 @@ class AgentRuntime:
         # local tools.  Recomputing independent relative budgets at each layer
         # would allow a run to spend the full limit several times.
         deadline = state.started_at + self.limits.max_wall_time_seconds
+        self._pending_efficiency_reminder = None
+        self._last_tool_signature = None
+        self._repeated_tool_batches = 0
+        self._last_result_signature = None
+        self._no_progress_batches = 0
 
         self._emit(
             "run.started",
@@ -173,10 +216,12 @@ class AgentRuntime:
                     self._terminate(state, RunPhase.LIMIT_REACHED, limit_reason)
                     break
 
+                final_response_only = self._final_response_only(state)
                 turn, context_window = self._next_valid_turn(
                     state,
                     usage_total,
                     deadline,
+                    allow_tools=not final_response_only,
                 )
                 state.model_turns += 1
                 self._emit(
@@ -192,6 +237,15 @@ class AgentRuntime:
                 # _next_valid_turn rejects an empty response, so the remaining
                 # cases are exhaustive: tool work or a non-empty final answer.
                 if turn.tool_calls:
+                    if final_response_only:
+                        # This should be caught by protocol validation; retain a
+                        # defensive terminal branch for injected model clients.
+                        self._terminate(
+                            state,
+                            RunPhase.FAILED,
+                            "final response turn requested tools",
+                        )
+                        break
                     terminal = self._execute_tool_batch(state, turn, deadline)
                     if terminal is not None:
                         phase, reason = terminal
@@ -199,10 +253,13 @@ class AgentRuntime:
                         break
 
                     state.transition(RunPhase.CHECKING_LIMITS)
-                    # A completed tool batch may have consumed the final model
-                    # turn.  We cannot ask the model to summarize after the
-                    # model-turn budget is exhausted, so terminate explicitly.
-                    if state.model_turns >= self.limits.max_model_turns:
+                    # In efficiency mode the last turn is reserved for a
+                    # tool-free final response. The old strategy keeps its
+                    # historical immediate limit behavior.
+                    if (
+                        state.model_turns >= self.limits.max_model_turns
+                        and not self._reserve_final_turn()
+                    ):
                         self._terminate(
                             state,
                             RunPhase.LIMIT_REACHED,
@@ -295,6 +352,8 @@ class AgentRuntime:
         state: RunState,
         usage_total: _UsageAccumulator,
         deadline: float,
+        *,
+        allow_tools: bool = True,
     ) -> tuple[ModelTurn, ContextWindow]:
         """Build context and obtain one structurally usable model response.
 
@@ -313,12 +372,28 @@ class AgentRuntime:
         while True:
             self._require_remaining_time(state, deadline)
             state.transition(RunPhase.BUILDING_CONTEXT)
-            schemas = self.tool_registry.model_schemas()
+            schemas = self.tool_registry.model_schemas() if allow_tools else ()
+            reminder = self._next_efficiency_reminder(state)
+            reminder_reservation = (
+                _serialized_message_reservation(reminder) if reminder else 0
+            )
             window = self.context_builder.build(
                 state.history,
                 schemas,
-                reserved_chars=extra_reserved_chars,
+                reserved_chars=extra_reserved_chars + reminder_reservation,
             )
+            if reminder:
+                window = _inject_context_reminder(
+                    window,
+                    reminder,
+                    tools=schemas,
+                    # ``ContextBuilder`` already reserved the reminder while
+                    # selecting blocks.  After the message is inserted, count
+                    # the actual reminder once and retain only the provider
+                    # overflow reservation; adding ``reminder_reservation``
+                    # again would make the reported window exceed its budget.
+                    reserved_chars=extra_reserved_chars,
+                )
             request_chars = estimate_request_chars(window, schemas)
             if (
                 previous_request_chars is not None
@@ -346,13 +421,18 @@ class AgentRuntime:
                     state,
                     usage_total,
                     deadline,
+                    tools=schemas,
                 )
                 # Response normalization happens in the adapter.  Structural
                 # and conversation-level validation below is still parsing from
                 # the controller's perspective, so expose that state before an
                 # invalid turn can trigger a protocol retry.
                 state.transition(RunPhase.PARSING_RESPONSE)
-                self._validate_turn(turn, state.history)
+                self._validate_turn(
+                    turn,
+                    state.history,
+                    allow_tool_calls=allow_tools,
+                )
                 self._require_remaining_time(state, deadline)
                 return turn, window
             except ContextOverflow:
@@ -394,6 +474,8 @@ class AgentRuntime:
         state: RunState,
         usage_total: _UsageAccumulator,
         deadline: float,
+        *,
+        tools: Sequence[dict[str, object]] | Sequence[object] = (),
     ) -> ModelTurn:
         """Call the model with bounded retries for transient failures only."""
 
@@ -411,7 +493,7 @@ class AgentRuntime:
             try:
                 turn = self.model_client.complete(
                     messages,
-                    self.tool_registry.model_schemas(),
+                    tools,
                     timeout_seconds=remaining_seconds,
                 )
                 # Usage belongs to physical API responses, including responses
@@ -443,7 +525,12 @@ class AgentRuntime:
                 raise
 
     @staticmethod
-    def _validate_turn(turn: ModelTurn, history: Sequence[Message]) -> None:
+    def _validate_turn(
+        turn: ModelTurn,
+        history: Sequence[Message],
+        *,
+        allow_tool_calls: bool = True,
+    ) -> None:
         """Reject empty output and call IDs already used in earlier turns."""
 
         if turn.finish_reason in {"length", "content_filter"}:
@@ -452,6 +539,11 @@ class AgentRuntime:
             # presenting the fragment as a completed task is safe.
             raise ResponseProtocolError(
                 f"assistant response is incomplete ({turn.finish_reason})"
+            )
+
+        if not allow_tool_calls and turn.tool_calls:
+            raise ResponseProtocolError(
+                "final response turn must not contain tool calls"
             )
 
         if not turn.tool_calls and not (turn.text and turn.text.strip()):
@@ -482,6 +574,98 @@ class AgentRuntime:
         if reused:
             raise ResponseProtocolError(
                 f"model reused a previous tool call id: {reused[0]!r}"
+            )
+
+    def _efficiency_enabled(self) -> bool:
+        return self.efficiency_policy.enabled
+
+    def _reserve_final_turn(self) -> bool:
+        # ``--reserve-final-turn`` is useful independently of reminders (for
+        # example in a controlled ablation), so do not silently discard an
+        # explicit true value merely because the reminder policy is disabled.
+        return self.efficiency_policy.reserve_final_turn
+
+    def _final_response_only(self, state: RunState) -> bool:
+        """Whether this request is the reserved, tool-free final turn."""
+
+        return self._reserve_final_turn() and (
+            state.model_turns == self.limits.max_model_turns - 1
+        )
+
+    def _next_efficiency_reminder(self, state: RunState) -> str | None:
+        if not self._efficiency_enabled():
+            return None
+        if self._pending_efficiency_reminder is not None:
+            reminder = self._pending_efficiency_reminder
+            self._pending_efficiency_reminder = None
+            self._emit(
+                "efficiency.reminder",
+                kind="replan" if reminder == _REPLAN_REMINDER else "convergence",
+                model_turn=state.model_turns + 1,
+            )
+            return reminder
+        remaining = self.limits.max_model_turns - state.model_turns
+        if remaining <= self.efficiency_policy.convergence_remaining_turns:
+            self._emit(
+                "efficiency.reminder",
+                kind="convergence",
+                model_turn=state.model_turns + 1,
+                remaining_turns=remaining,
+            )
+            return _CONVERGENCE_REMINDER
+        return None
+
+    def _observe_tool_batch(
+        self,
+        turn: ModelTurn,
+        results: Sequence[ToolResult],
+    ) -> None:
+        """Detect repeated/no-progress batches and schedule one re-plan hint."""
+
+        if not self._efficiency_enabled():
+            return
+        signature_payload = [
+            (call.name, call.arguments_json) for call in turn.tool_calls
+        ]
+        signature = hashlib.sha256(
+            json.dumps(
+                signature_payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if signature == self._last_tool_signature:
+            self._repeated_tool_batches += 1
+        else:
+            self._repeated_tool_batches = 0
+        self._last_tool_signature = signature
+
+        result_payload = [
+            (item.name, item.ok, item.error_code, item.content, dict(item.metadata))
+            for item in results
+        ]
+        result_signature = hashlib.sha256(
+            json.dumps(
+                result_payload, ensure_ascii=False, sort_keys=True, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+        if result_signature == self._last_result_signature:
+            self._no_progress_batches += 1
+        else:
+            self._no_progress_batches = 0
+        self._last_result_signature = result_signature
+
+        repeated = (
+            self._repeated_tool_batches
+            >= self.efficiency_policy.max_repeated_tool_batches
+        )
+        stagnant = (
+            self._no_progress_batches >= self.efficiency_policy.max_no_progress_batches
+        )
+        if (repeated or stagnant) and self._pending_efficiency_reminder is None:
+            self._pending_efficiency_reminder = _REPLAN_REMINDER
+            self._emit(
+                "efficiency.replan_requested",
+                repeated_batches=self._repeated_tool_batches,
+                no_progress_batches=self._no_progress_batches,
             )
 
     def _execute_tool_batch(
@@ -637,6 +821,7 @@ class AgentRuntime:
                 metadata=dict(result.metadata),
             )
 
+        self._observe_tool_batch(turn, results)
         self._record_tool_transaction(state, turn, results)
         return None
 
@@ -755,6 +940,41 @@ class AgentRuntime:
         return bool(self._cancel_check and self._cancel_check())
 
 
+def _serialized_message_reservation(text: str | None) -> int:
+    if not text:
+        return 0
+    # Include a generous fixed envelope margin for list separators and the
+    # system-role wrapper. This is a budget reservation, not token accounting.
+    return len(json.dumps({"role": "system", "content": text}, ensure_ascii=False)) + 64
+
+
+def _inject_context_reminder(
+    window: ContextWindow,
+    text: str,
+    *,
+    tools: Sequence[Mapping[str, object]],
+    reserved_chars: int = 0,
+) -> ContextWindow:
+    """Add an ephemeral system hint while keeping canonical history untouched."""
+
+    reminder = Message(role="system", content=text)
+    messages = list(window.messages)
+    insert_at = next(
+        (index for index, message in enumerate(messages) if message.role == "user"),
+        0,
+    )
+    messages.insert(insert_at, reminder)
+    estimated = estimate_request_chars(
+        tuple(messages), tools, reserved_chars=reserved_chars
+    )
+    return ContextWindow(
+        messages=tuple(messages),
+        estimated_chars=estimated,
+        truncated=window.truncated,
+        omitted_blocks=window.omitted_blocks,
+    )
+
+
 class _UsageAccumulator:
     """Add provider token counts without inventing missing measurements."""
 
@@ -763,9 +983,13 @@ class _UsageAccumulator:
         self._prompt = 0
         self._completion = 0
         self._total = 0
+        self._cached = 0
+        self._reasoning = 0
         self._prompt_complete = True
         self._completion_complete = True
         self._total_complete = True
+        self._cached_complete = True
+        self._reasoning_complete = True
 
     def add(self, usage: Usage | None) -> None:
         if usage is None:
@@ -776,6 +1000,8 @@ class _UsageAccumulator:
             self._prompt_complete = False
             self._completion_complete = False
             self._total_complete = False
+            self._cached_complete = False
+            self._reasoning_complete = False
             return
         self._seen_usage = True
         self._prompt, self._prompt_complete = self._add_field(
@@ -788,6 +1014,12 @@ class _UsageAccumulator:
         )
         self._total, self._total_complete = self._add_field(
             self._total, self._total_complete, usage.total_tokens
+        )
+        self._cached, self._cached_complete = self._add_field(
+            self._cached, self._cached_complete, usage.cached_tokens
+        )
+        self._reasoning, self._reasoning_complete = self._add_field(
+            self._reasoning, self._reasoning_complete, usage.reasoning_tokens
         )
 
     @staticmethod
@@ -803,4 +1035,6 @@ class _UsageAccumulator:
             prompt_tokens=self._prompt if self._prompt_complete else None,
             completion_tokens=(self._completion if self._completion_complete else None),
             total_tokens=self._total if self._total_complete else None,
+            cached_tokens=self._cached if self._cached_complete else None,
+            reasoning_tokens=(self._reasoning if self._reasoning_complete else None),
         )

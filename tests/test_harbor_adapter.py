@@ -64,6 +64,33 @@ def test_remote_backend_accepts_timeout_named_harbor_style() -> None:
     asyncio.run(scenario())
 
 
+def test_remote_backend_does_not_retry_a_sync_type_error() -> None:
+    """A post-execution TypeError must not cause a second remote command."""
+
+    class SyncEnvironment:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float | None]] = []
+
+        def exec(self, command: str, *, timeout_seconds=None):
+            self.calls.append((command, timeout_seconds))
+            raise TypeError("result conversion failed after execution")
+
+    async def scenario() -> None:
+        environment = SyncEnvironment()
+        backend = RemoteCommandBackend(environment)
+        backend.bind_loop(asyncio.get_running_loop())
+        result = await asyncio.to_thread(
+            backend.execute_call,
+            ToolCall("sync-type-error", "run_command", '{"command":"touch marker"}'),
+            timeout_seconds=2,
+        )
+        assert result.ok is False
+        assert result.error_code == "remote_execution_error"
+        assert len(environment.calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_remote_backend_accepts_native_harbor_exec_signature_and_result() -> None:
     """Exercise Harbor 0.22's ``timeout_sec``/``return_code`` contract.
 

@@ -22,6 +22,39 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
+class EfficiencyPolicy:
+    """Optional turn-management policy used by evaluation runs.
+
+    This small value object is convenient for callers that do not want to
+    encode strategy knobs in ``AgentLimits``.  ``AgentRuntime`` converts it to
+    the equivalent limit fields when supplied.
+    """
+
+    enabled: bool = False
+    reserve_final_turn: bool = True
+    convergence_remaining_turns: int = 5
+    max_repeated_tool_batches: int = 2
+    max_no_progress_batches: int = 2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool) or not isinstance(
+            self.reserve_final_turn, bool
+        ):
+            raise TypeError("efficiency policy flags must be bools")
+        for name, value in (
+            ("convergence_remaining_turns", self.convergence_remaining_turns),
+            ("max_repeated_tool_batches", self.max_repeated_tool_batches),
+            ("max_no_progress_batches", self.max_no_progress_batches),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if name == "convergence_remaining_turns" and value < 0:
+                raise ValueError(f"{name} must be non-negative")
+            if name != "convergence_remaining_turns" and value < 1:
+                raise ValueError(f"{name} must be greater than zero")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentLimits:
     """Hard resource limits applied to one Agent run.
 
@@ -44,6 +77,14 @@ class AgentLimits:
     max_wall_time_seconds: float = 900.0
     max_model_retries: int = 3
     max_protocol_retries: int = 1
+    # Efficiency controls are opt-in so existing callers retain the original
+    # protocol exactly.  They are deliberately data-only; AgentRuntime owns
+    # the corresponding state transitions.
+    efficiency_mode: bool = False
+    reserve_final_turn: bool = False
+    convergence_remaining_turns: int = 5
+    max_repeated_tool_batches: int = 2
+    max_no_progress_batches: int = 2
 
     def __post_init__(self) -> None:
         integer_fields = {
@@ -51,6 +92,9 @@ class AgentLimits:
             "max_tool_calls": self.max_tool_calls,
             "max_model_retries": self.max_model_retries,
             "max_protocol_retries": self.max_protocol_retries,
+            "convergence_remaining_turns": self.convergence_remaining_turns,
+            "max_repeated_tool_batches": self.max_repeated_tool_batches,
+            "max_no_progress_batches": self.max_no_progress_batches,
         }
         for name, value in integer_fields.items():
             # ``bool`` is an ``int`` subclass.  Accepting True as a budget of
@@ -61,6 +105,16 @@ class AgentLimits:
             raise ValueError("max_model_turns must be greater than zero")
         if self.max_tool_calls == 0:
             raise ValueError("max_tool_calls must be greater than zero")
+        if self.convergence_remaining_turns < 0:
+            raise ValueError("convergence_remaining_turns must be non-negative")
+        if self.max_repeated_tool_batches < 1:
+            raise ValueError("max_repeated_tool_batches must be greater than zero")
+        if self.max_no_progress_batches < 1:
+            raise ValueError("max_no_progress_batches must be greater than zero")
+        if not isinstance(self.efficiency_mode, bool):
+            raise TypeError("efficiency_mode must be a bool")
+        if not isinstance(self.reserve_final_turn, bool):
+            raise TypeError("reserve_final_turn must be a bool")
         if (
             not isinstance(self.max_wall_time_seconds, (int, float))
             or isinstance(self.max_wall_time_seconds, bool)

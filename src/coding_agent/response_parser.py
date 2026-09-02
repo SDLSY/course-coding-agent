@@ -55,7 +55,44 @@ def _normalize_usage(response: Any) -> Usage | None:
         prompt_tokens=_optional_token_count(raw_usage, "prompt_tokens"),
         completion_tokens=_optional_token_count(raw_usage, "completion_tokens"),
         total_tokens=_optional_token_count(raw_usage, "total_tokens"),
+        cached_tokens=_optional_nested_token_count(
+            raw_usage,
+            "prompt_tokens_details",
+            "cached_tokens",
+            fallback_names=("cached_tokens", "cache_tokens"),
+        ),
+        reasoning_tokens=_optional_nested_token_count(
+            raw_usage,
+            "completion_tokens_details",
+            "reasoning_tokens",
+            fallback_names=("reasoning_tokens",),
+        ),
     )
+
+
+def _optional_nested_token_count(
+    usage: Any,
+    container_name: str,
+    field_name: str,
+    *,
+    fallback_names: tuple[str, ...] = (),
+) -> int | None:
+    """Read provider token detail fields without requiring their presence."""
+
+    container = _field(usage, container_name, None)
+    value = _field(container, field_name, None) if container is not None else None
+    if value is None:
+        for name in fallback_names:
+            value = _field(usage, name, None)
+            if value is not None:
+                break
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResponseProtocolError(
+            f"usage.{field_name} must be a non-negative integer or null"
+        )
+    return value
 
 
 def _normalize_tool_calls(message: Any) -> tuple[ToolCall, ...]:

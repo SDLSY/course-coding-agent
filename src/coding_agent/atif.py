@@ -296,10 +296,24 @@ def _atif_tool_call(call: ToolCall) -> dict[str, Any]:
 
 
 def _copy_usage(target: dict[str, Any], usage: Usage) -> None:
+    # ATIF's FinalMetrics schema is intentionally strict.  Keep the two
+    # provider/accounting fields that are not part of the standard schema in
+    # its explicitly extensible ``extra`` mapping instead of emitting unknown
+    # top-level keys that Harbor rejects with ``extra_forbidden``.
+    extra: dict[str, Any] | None = None
     if usage.prompt_tokens is not None:
         target["total_prompt_tokens"] = usage.prompt_tokens
     if usage.completion_tokens is not None:
         target["total_completion_tokens"] = usage.completion_tokens
+    if usage.cached_tokens is not None:
+        target["total_cached_tokens"] = usage.cached_tokens
+    if usage.total_tokens is not None:
+        extra = target.setdefault("extra", {})
+        extra["total_tokens"] = usage.total_tokens
+    if usage.reasoning_tokens is not None:
+        if extra is None:
+            extra = target.setdefault("extra", {})
+        extra["total_reasoning_tokens"] = usage.reasoning_tokens
 
 
 def _enum_or_value(value: Any) -> Any:

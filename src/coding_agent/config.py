@@ -40,6 +40,20 @@ class Provider(str, Enum):
     CUSTOM = "custom"
 
 
+class ReasoningEffort(str, Enum):
+    """Portable labels for a provider's native reasoning budget.
+
+    The label is metadata until a gateway is proven to accept the corresponding
+    native request field.  In particular, selecting ``high`` never causes the
+    runtime to prepend a fake instruction to the user prompt.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    MAX = "max"
+
+
 # These are OpenAI-compatible API roots, not chat-completion endpoint URLs.
 # The OpenAI client appends the resource path itself.
 #
@@ -103,6 +117,16 @@ class AgentConfig:
     model_timeout_seconds: float = 120.0
     model_max_retries: int = 2
     protocol_max_retries: int = 1
+    reasoning_effort: str | None = None
+    # Native request field selected by a capability probe.  Keeping the field
+    # explicit makes an alternate provider spelling such as ``thinking``
+    # auditable; it is never encoded into the prompt as a fake instruction.
+    reasoning_parameter: str = "reasoning_effort"
+    efficiency_mode: bool = False
+    reserve_final_turn: bool = False
+    convergence_remaining_turns: int = 5
+    max_repeated_tool_batches: int = 2
+    max_no_progress_batches: int = 2
 
     @classmethod
     def from_sources(
@@ -122,6 +146,13 @@ class AgentConfig:
         model_timeout_seconds: float | str | None = None,
         model_max_retries: int | str | None = None,
         protocol_max_retries: int | str | None = None,
+        reasoning_effort: str | ReasoningEffort | None = None,
+        reasoning_parameter: str | None = None,
+        efficiency_mode: bool | str | None = None,
+        reserve_final_turn: bool | str | None = None,
+        convergence_remaining_turns: int | str | None = None,
+        max_repeated_tool_batches: int | str | None = None,
+        max_no_progress_batches: int | str | None = None,
         environ: Mapping[str, str] | None = None,
         cwd: str | os.PathLike[str] | None = None,
     ) -> AgentConfig:
@@ -248,6 +279,62 @@ class AgentConfig:
                 ),
                 "protocol_max_retries",
             ),
+            reasoning_effort=_optional_reasoning_effort(
+                _choose(
+                    reasoning_effort,
+                    source_env,
+                    "CODING_AGENT_REASONING_EFFORT",
+                )
+            ),
+            reasoning_parameter=_validate_reasoning_parameter(
+                _choose(
+                    reasoning_parameter,
+                    source_env,
+                    "CODING_AGENT_REASONING_PARAMETER",
+                    "reasoning_effort",
+                )
+            ),
+            efficiency_mode=_optional_bool(
+                _choose(efficiency_mode, source_env, "CODING_AGENT_EFFICIENCY"),
+                "efficiency_mode",
+                default=False,
+            ),
+            reserve_final_turn=_optional_bool(
+                _choose(
+                    reserve_final_turn,
+                    source_env,
+                    "CODING_AGENT_RESERVE_FINAL_TURN",
+                ),
+                "reserve_final_turn",
+                default=False,
+            ),
+            convergence_remaining_turns=_nonnegative_int(
+                _choose(
+                    convergence_remaining_turns,
+                    source_env,
+                    "CODING_AGENT_CONVERGENCE_REMAINING_TURNS",
+                    5,
+                ),
+                "convergence_remaining_turns",
+            ),
+            max_repeated_tool_batches=_positive_int(
+                _choose(
+                    max_repeated_tool_batches,
+                    source_env,
+                    "CODING_AGENT_MAX_REPEATED_TOOL_BATCHES",
+                    2,
+                ),
+                "max_repeated_tool_batches",
+            ),
+            max_no_progress_batches=_positive_int(
+                _choose(
+                    max_no_progress_batches,
+                    source_env,
+                    "CODING_AGENT_MAX_NO_PROGRESS_BATCHES",
+                    2,
+                ),
+                "max_no_progress_batches",
+            ),
         )
 
     def redacted_summary(self) -> dict[str, object]:
@@ -271,6 +358,13 @@ class AgentConfig:
             "model_timeout_seconds": self.model_timeout_seconds,
             "model_max_retries": self.model_max_retries,
             "protocol_max_retries": self.protocol_max_retries,
+            "reasoning_effort": self.reasoning_effort,
+            "reasoning_parameter": self.reasoning_parameter,
+            "efficiency_mode": self.efficiency_mode,
+            "reserve_final_turn": self.reserve_final_turn,
+            "convergence_remaining_turns": self.convergence_remaining_turns,
+            "max_repeated_tool_batches": self.max_repeated_tool_batches,
+            "max_no_progress_batches": self.max_no_progress_batches,
         }
 
 
@@ -381,6 +475,50 @@ def _normalise_base_url(value: object) -> str:
     # trailing-slash variants deterministic for equality and logging.
     path = parsed.path.rstrip("/")
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _optional_reasoning_effort(value: object | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, ReasoningEffort):
+        return value.value
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            "reasoning_effort must be one of: low, medium, high, max"
+        )
+    normalized = value.strip().lower()
+    if normalized not in {item.value for item in ReasoningEffort}:
+        raise ConfigurationError(
+            "reasoning_effort must be one of: low, medium, high, max"
+        )
+    return normalized
+
+
+def _validate_reasoning_parameter(value: object | None) -> str:
+    """Validate the native JSON field used for a reasoning effort value."""
+
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value.strip()) is None
+    ):
+        raise ConfigurationError(
+            "reasoning_parameter must be an environment/API field name"
+        )
+    return value.strip()
+
+
+def _optional_bool(value: object | None, field_name: str, *, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ConfigurationError(f"{field_name} must be a boolean")
 
 
 def _is_loopback_host(hostname: str) -> bool:

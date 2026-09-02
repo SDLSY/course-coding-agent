@@ -11,11 +11,12 @@ from coding_agent.errors import (
     ConfigurationError,
     ContextOverflow,
     PermanentModelError,
+    ReasoningEffortUnsupported,
     ResponseProtocolError,
     ToolRequestError,
     TransientModelError,
 )
-from coding_agent.model import OpenAICompatibleModelClient
+from coding_agent.model import OpenAICompatibleModelClient, ReasoningCapability
 from coding_agent.response_parser import normalize_chat_completion, parse_tool_arguments
 from coding_agent.types import Message, ToolCall, ToolResult
 from tests.fakes import FakeOpenAIClient, chat_completion, raw_tool_call
@@ -272,6 +273,141 @@ def test_adapter_sends_tools_without_mutating_schema() -> None:
 
     assert fake.completions.requests[0]["tools"] == [schema]
     assert schema["function"]["name"] == "read_file"
+
+
+def test_reasoning_probe_accepts_high_and_forwards_native_field() -> None:
+    fake = FakeOpenAIClient(
+        [chat_completion(content="ok"), chat_completion(content="done")]
+    )
+    adapter = OpenAICompatibleModelClient(
+        model="m",
+        client=fake,
+        api_key="EXAMPLE_CREDENTIAL_NOT_REAL",
+        reasoning_effort="high",
+    )
+
+    capability = adapter.probe_reasoning_effort()
+    adapter.complete([Message(role="user", content="task")], [])
+
+    assert capability == ReasoningCapability(
+        status="supported",
+        requested_effort="high",
+        parameter="reasoning_effort",
+        accepted_value="high",
+    )
+    assert fake.completions.requests[0]["reasoning_effort"] == "high"
+    assert fake.completions.requests[1]["reasoning_effort"] == "high"
+
+
+def test_reasoning_probe_tries_alternate_parameter_after_unknown_field() -> None:
+    class UnknownField(Exception):
+        status_code = 422
+
+    fake = FakeOpenAIClient(
+        [
+            UnknownField("unknown parameter reasoning_effort"),
+            chat_completion(content="ok"),
+        ]
+    )
+    adapter = OpenAICompatibleModelClient(
+        model="m", client=fake, api_key="EXAMPLE_CREDENTIAL_NOT_REAL"
+    )
+
+    capability = adapter.probe_reasoning_effort("high")
+
+    assert capability.status == "supported"
+    assert capability.parameter == "thinking"
+    assert capability.accepted_value == "high"
+    assert "reasoning_effort" in fake.completions.requests[0]
+    assert fake.completions.requests[1]["thinking"] == "high"
+
+
+def test_reasoning_probe_records_lower_native_level_after_value_rejection() -> None:
+    class InvalidValue(Exception):
+        status_code = 400
+
+    fake = FakeOpenAIClient(
+        [
+            InvalidValue("invalid value for reasoning_effort; allowed values: low"),
+            InvalidValue("invalid value for reasoning_effort; allowed values: low"),
+            chat_completion(content="ok"),
+        ]
+    )
+    adapter = OpenAICompatibleModelClient(
+        model="m", client=fake, api_key="EXAMPLE_CREDENTIAL_NOT_REAL"
+    )
+
+    capability = adapter.probe_reasoning_effort("high")
+
+    assert capability.status == "supported"
+    assert capability.accepted_value == "low"
+    assert [request["reasoning_effort"] for request in fake.completions.requests] == [
+        "high",
+        "medium",
+        "low",
+    ]
+
+
+def test_reasoning_probe_marks_provider_error_and_redacts_secret() -> None:
+    secret = "EXAMPLE_CREDENTIAL_NOT_REAL"
+
+    class GatewayFailure(Exception):
+        status_code = 503
+
+    fake = FakeOpenAIClient(
+        [GatewayFailure(f"temporary failure Authorization: Bearer {secret}")]
+    )
+    adapter = OpenAICompatibleModelClient(model="m", client=fake, api_key=secret)
+
+    capability = adapter.probe_reasoning_effort("high")
+
+    assert capability.status == "error"
+    assert capability.error_type == "GatewayFailure"
+    assert secret not in (capability.detail or "")
+    assert "[REDACTED]" in (capability.detail or "")
+    assert len(fake.completions.requests) == 1
+
+
+def test_reasoning_probe_explicit_unsupported_fails_closed_at_runtime() -> None:
+    fake = FakeOpenAIClient(
+        [ReasoningEffortUnsupported("native reasoning is unsupported")]
+    )
+    adapter = OpenAICompatibleModelClient(
+        model="m",
+        client=fake,
+        api_key="EXAMPLE_CREDENTIAL_NOT_REAL",
+        reasoning_effort="high",
+    )
+
+    capability = adapter.probe_reasoning_effort()
+    assert capability.status == "unsupported"
+    with pytest.raises(ConfigurationError, match="unsupported"):
+        adapter.complete([Message(role="user", content="task")], [])
+    # No second request can accidentally downgrade or imitate reasoning.
+    assert len(fake.completions.requests) == 1
+
+
+def test_reasoning_value_preserves_boolean_and_dynamic_extra_field_is_protected() -> (
+    None
+):
+    fake = FakeOpenAIClient([chat_completion(content="done")])
+    adapter = OpenAICompatibleModelClient(
+        model="m",
+        client=fake,
+        reasoning_parameter="thinking",
+        reasoning_value=False,
+    )
+    adapter.complete([Message(role="user", content="task")], [])
+    assert fake.completions.requests[0]["thinking"] is False
+
+    with pytest.raises(ConfigurationError, match="managed fields"):
+        OpenAICompatibleModelClient(
+            model="m",
+            client=FakeOpenAIClient([]),
+            reasoning_parameter="thinking",
+            reasoning_effort="high",
+            extra_request_options={"thinking": "low"},
+        )
 
 
 class RateLimitError(Exception):

@@ -545,6 +545,134 @@ def test_final_allowed_model_turn_spent_on_tools_ends_at_limit() -> None:
     assert result.model_turns == 1
 
 
+def test_efficiency_mode_reserves_a_tool_free_final_turn() -> None:
+    first = ToolCall("first", "record_value", '{"value":"x"}')
+    model = ScriptedModel([ModelTurn(tool_calls=(first,)), ModelTurn(text="Finished.")])
+
+    result = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool()]),
+        limits=AgentLimits(
+            max_model_turns=2,
+            efficiency_mode=True,
+            reserve_final_turn=True,
+        ),
+    ).run("Leave one turn for the final answer.")
+
+    assert result.phase is RunPhase.COMPLETED
+    assert result.model_turns == 2
+    assert model.calls[1].tools == ()
+
+
+def test_efficiency_mode_defaults_to_reserving_the_final_turn() -> None:
+    first = ToolCall("first", "record_value", '{"value":"x"}')
+    model = ScriptedModel([ModelTurn(tool_calls=(first,)), ModelTurn(text="Finished.")])
+
+    runtime = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool()]),
+        limits=AgentLimits(max_model_turns=2, efficiency_mode=True),
+    )
+
+    result = runtime.run("Use the efficient default.")
+
+    assert result.phase is RunPhase.COMPLETED
+    assert result.model_turns == 2
+    assert runtime.efficiency_policy.reserve_final_turn is True
+    assert model.calls[1].tools == ()
+
+
+def test_final_reserved_turn_rejects_tool_calls() -> None:
+    first = ToolCall("first", "record_value", '{"value":"x"}')
+    invalid_final = ToolCall("final", "record_value", '{"value":"y"}')
+    model = ScriptedModel(
+        [ModelTurn(tool_calls=(first,)), ModelTurn(tool_calls=(invalid_final,))]
+    )
+
+    result = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool()]),
+        limits=AgentLimits(
+            max_model_turns=2,
+            max_protocol_retries=0,
+            efficiency_mode=True,
+            reserve_final_turn=True,
+        ),
+    ).run("Do not use tools on the final turn.")
+
+    assert result.phase is RunPhase.FAILED
+    assert result.model_turns == 1
+    assert result.tool_calls == 1
+    assert len([message for message in result.history if message.role == "tool"]) == 1
+
+
+def test_efficiency_mode_injects_convergence_reminder_without_mutating_history() -> (
+    None
+):
+    first = ToolCall("first", "record_value", '{"value":"x"}')
+    model = ScriptedModel([ModelTurn(tool_calls=(first,)), ModelTurn(text="Finished.")])
+    limits = AgentLimits(
+        max_model_turns=6,
+        efficiency_mode=True,
+        reserve_final_turn=True,
+        convergence_remaining_turns=5,
+    )
+
+    result = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool()]),
+        limits=limits,
+    ).run("Converge after one observation.")
+
+    assert result.phase is RunPhase.COMPLETED
+    reminder_messages = [
+        message
+        for message in model.calls[1].messages
+        if message.role == "system" and "Converge now" in (message.content or "")
+    ]
+    assert len(reminder_messages) == 1
+    # The reminder is ephemeral and must not become canonical history.
+    assert all(
+        "Converge now" not in (message.content or "") for message in result.history
+    )
+
+
+def test_efficiency_mode_requests_replan_after_repeated_tool_batches() -> None:
+    calls = [
+        ToolCall("a", "record_value", '{"value":"same"}'),
+        ToolCall("b", "record_value", '{"value":"same"}'),
+        ToolCall("c", "record_value", '{"value":"same"}'),
+    ]
+    model = ScriptedModel(
+        [
+            ModelTurn(tool_calls=(calls[0],)),
+            ModelTurn(tool_calls=(calls[1],)),
+            ModelTurn(tool_calls=(calls[2],)),
+            ModelTurn(text="Finished."),
+        ]
+    )
+
+    result = _runtime(
+        model,
+        registry=ToolRegistry([_value_tool()]),
+        limits=AgentLimits(
+            max_model_turns=8,
+            efficiency_mode=True,
+            reserve_final_turn=True,
+            convergence_remaining_turns=0,
+            max_repeated_tool_batches=1,
+            max_no_progress_batches=99,
+        ),
+    ).run("Re-plan repeated observations.")
+
+    assert result.phase is RunPhase.COMPLETED
+    assert any(
+        message.role == "system"
+        and "repeated the same request" in (message.content or "")
+        for message in model.calls[2].messages
+    )
+
+
 def test_reused_tool_call_id_is_protocol_retried_before_history_append() -> None:
     first = ToolCall("same-id", "record_value", '{"value":"one"}')
     reused = ToolCall("same-id", "record_value", '{"value":"two"}')

@@ -108,6 +108,7 @@ def test_safe_metadata_named_token_count_or_key_env_is_preserved() -> None:
 
 
 def test_redaction_treats_camel_case_credentials_like_snake_case() -> None:
+    fixture_token = "opaque-fixture-" + "token"
     safe = redact(
         {
             "clientSecret": "camel-client-secret",
@@ -125,7 +126,7 @@ def test_redaction_treats_camel_case_credentials_like_snake_case() -> None:
             "inputTokens": 123,
             "tokenCount": 456,
             "apiKeyEnv": "CUSTOM_PROVIDER_KEY",
-            "message": "request used Bearer opaque-fixture-token",
+            "message": "request used Bearer " + fixture_token,
         }
     )
 

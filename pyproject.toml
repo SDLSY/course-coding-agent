@@ -17,6 +17,9 @@ test = [
   "pytest>=8,<10",
   "ruff>=0.16,<0.17",
 ]
+harbor = [
+  "harbor==0.22.0",
+]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:main"

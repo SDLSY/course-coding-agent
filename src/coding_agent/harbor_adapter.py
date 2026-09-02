@@ -18,6 +18,7 @@ import json
 import os
 import shlex
 import tempfile
+import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -604,6 +605,9 @@ class HarborAgentAdapter:
         secrets: Sequence[str] = (),
         verification: Any | None = None,
         events: Sequence[Mapping[str, Any]] = (),
+        events_provider: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+        artifact_metadata: Mapping[str, Any] | None = None,
+        cancel_event: threading.Event | None = None,
         artifact_error_hook: Callable[[Exception], Awaitable[None] | None]
         | None = None,
     ) -> None:
@@ -624,6 +628,9 @@ class HarborAgentAdapter:
         self.secrets = tuple(secrets)
         self.verification = verification
         self.events = tuple(events)
+        self.events_provider = events_provider
+        self.artifact_metadata = dict(artifact_metadata or {})
+        self.cancel_event = cancel_event
         self.artifact_error_hook = artifact_error_hook
 
     async def run(self, task: str) -> Any:
@@ -636,9 +643,25 @@ class HarborAgentAdapter:
             # This assignment is intentionally opt-in so ordinary local runs
             # remain untouched.
             self.runtime.tool_registry = self.backend
-        result = await asyncio.to_thread(self.runtime.run, task)
+        # Keep the worker as a Task so an outer Harbor cancellation can signal
+        # the Runtime without abandoning a still-running thread object.
+        worker = asyncio.create_task(asyncio.to_thread(self.runtime.run, task))
+        try:
+            result = await worker
+        except asyncio.CancelledError:
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            # The Runtime checks its cancellation callback at protocol
+            # boundaries.  Do not block Harbor's cancellation path waiting for
+            # an arbitrary provider request; the worker is left to finish under
+            # its own finite timeout and cannot start a new batch after the
+            # signal is observed.
+            raise
         if self.artifact_dir is not None:
             try:
+                artifact_events = self.events
+                if self.events_provider is not None:
+                    artifact_events = tuple(self.events_provider())
                 write_harbor_artifacts(
                     result,
                     log_dir=self.artifact_dir,
@@ -647,8 +670,9 @@ class HarborAgentAdapter:
                     run_id=self.run_id,
                     tool_definitions=self.tool_definitions,
                     verification=self.verification,
-                    events=self.events,
+                    events=artifact_events,
                     secrets=self.secrets,
+                    metadata=self.artifact_metadata,
                 )
             except Exception as exc:  # noqa: BLE001 - optional diagnostics
                 # Artifact persistence must never change the Runtime's terminal
@@ -671,6 +695,7 @@ def write_harbor_artifacts(
     verification: Any | None = None,
     events: Sequence[Mapping[str, Any]] = (),
     secrets: Sequence[str] = (),
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Path]:
     """Write Harbor-friendly trajectory and summary files atomically.
 
@@ -705,12 +730,32 @@ def write_harbor_artifacts(
             "model_requests": getattr(run, "model_requests", None),
             "tool_calls": getattr(run, "tool_calls", None),
             "elapsed_seconds": getattr(run, "elapsed_seconds", None),
+            "input_tokens": _usage_field(getattr(run, "usage", None), "prompt_tokens"),
+            "output_tokens": _usage_field(
+                getattr(run, "usage", None), "completion_tokens"
+            ),
+            "cache_tokens": _usage_field(getattr(run, "usage", None), "cached_tokens"),
+            "total_tokens": _usage_field(getattr(run, "usage", None), "total_tokens"),
             "verification": _json_safe_value(verification),
+            **dict(metadata or {}),
         },
         secrets=secrets,
     )
     summary_path = _write_json_atomically(directory / "run.json", summary)
     return {"trajectory": trajectory_path, "summary": summary_path}
+
+
+def _usage_field(usage: Any, name: str) -> int | float | None:
+    if usage is None:
+        return None
+    value = getattr(usage, name, None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if isinstance(usage, Mapping):
+        value = usage.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def _write_json_atomically(path: Path, value: Any) -> Path:
@@ -824,29 +869,46 @@ def _environment_exec(
     """
 
     # Harbor 0.22 uses ``timeout_sec``; a few compatible environments use
-    # ``timeout`` or the more descriptive ``timeout_seconds``.  Try aliases at
-    # call time, when Python can report a keyword-signature mismatch without
-    # scheduling a command.  The first accepted coroutine is returned exactly
-    # once, so a mismatch cannot execute the remote operation twice.
-    first_error: TypeError | None = None
-    for keyword in ("timeout_seconds", "timeout", "timeout_sec"):
-        try:
-            result = environment.exec(  # type: ignore[call-arg]
-                command,
-                **{keyword: timeout_seconds},
-            )
-            if inspect.isawaitable(result):
-                return result
+    # ``timeout`` or the more descriptive ``timeout_seconds``.  Select the
+    # supported spelling from the callable signature before invoking it.  A
+    # retry based on catching ``TypeError`` is unsafe for synchronous wrappers:
+    # such a wrapper may execute the command and then raise ``TypeError`` from
+    # its result handling, causing a second invocation with another alias.
+    method = environment.exec
+    keyword: str | None = None
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        # Dynamic/C-extension callables do not expose a signature.  Omitting
+        # the optional keyword is the only fail-safe choice: the worker-side
+        # future still enforces the same upper bound, and no speculative retry
+        # can duplicate a mutating command.
+        signature = None
+    if signature is not None:
+        parameters = signature.parameters.values()
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        ):
+            keyword = "timeout_seconds"
+        else:
+            for candidate in ("timeout_seconds", "timeout", "timeout_sec"):
+                parameter = signature.parameters.get(candidate)
+                if (
+                    parameter is not None
+                    and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+                ):
+                    keyword = candidate
+                    break
 
-            async def _completed(value: Any = result) -> Any:
-                return value
+    kwargs = {keyword: timeout_seconds} if keyword is not None else {}
+    result = method(command, **kwargs)  # type: ignore[call-arg]
+    if inspect.isawaitable(result):
+        return result
 
-            return _completed()
-        except TypeError as exc:
-            if first_error is None:
-                first_error = exc
-    assert first_error is not None
-    raise first_error
+    async def _completed(value: Any = result) -> Any:
+        return value
+
+    return _completed()
 
 
 def _json_safe_value(value: Any) -> Any:

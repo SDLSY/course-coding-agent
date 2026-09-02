@@ -34,6 +34,15 @@ class PermanentModelError(ModelError):
     """A model request cannot succeed without changing configuration or input."""
 
 
+class ReasoningEffortUnsupported(PermanentModelError):
+    """The selected gateway rejected the requested native reasoning option.
+
+    This is kept separate from a generic permanent model error so a preflight
+    probe can report ``unsupported`` without silently retrying with a made-up
+    prompt instruction or a different effort level.
+    """
+
+
 class ContextOverflow(ModelError):
     """Required prompt content cannot fit in the configured context budget."""
 

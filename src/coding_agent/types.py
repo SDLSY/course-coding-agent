@@ -242,6 +242,22 @@ class Usage:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    @property
+    def input_tokens(self) -> int | None:
+        """Alias used by benchmark/report consumers."""
+
+        return self.prompt_tokens
+
+    @property
+    def output_tokens(self) -> int | None:
+        return self.completion_tokens
+
+    @property
+    def cache_tokens(self) -> int | None:
+        return self.cached_tokens
 
 
 @dataclass(frozen=True, slots=True)

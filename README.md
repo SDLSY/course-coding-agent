@@ -2,7 +2,7 @@
 
 一个不依赖 Agent 框架、从普通模型 API 之上自行实现控制循环的轻量编程智能体。给定自然语言任务和本地工作区后，它会让模型选择工具，依次读取、搜索和修改文件，运行命令，并把每次观察结果加入对话历史，直到模型返回最终回答或运行预算耗尽。
 
-本项目面向软件工程课程项目和 Agent Runtime 学习，而不是商业编程助手的完整替代品。详细设计依据见 [`agent.md`](agent.md)。
+本项目面向软件工程课程项目和 Agent Runtime 学习，而不是商业编程助手的完整替代品。本 README 同时记录公开的设计边界、运行方式和验收约束。
 
 ## 项目边界
 
@@ -206,13 +206,46 @@ coding-agent \
 
 `--verify`（也可写作 `--verify-command`）只接受运行者预先配置的命令。命令在 Runtime 结束后独立运行，不进入模型历史，也不计入 Agent 的模型/工具预算。报告会显示每个检查的退出码和 timeout；模型正常停止但检查失败时，CLI 返回专用退出码 `4`。没有指定 `--verify` 时，原有退出码和行为保持不变。验收命令同样运行在当前用户权限下，不能视为安全沙箱。
 
+## 提交包
+
+真实演示录制完成后，用 `scripts/build_submission.py` 生成严格的两文件归档。脚本默认检查 UTF-8 `README.txt` 不超过 1000 字符、MP4 不超过 200 MB 且时长不超过 120 秒，并扫描常见 key/Bearer 模式和当前进程中已配置的 key 值：
+
+```bash
+python3 scripts/build_submission.py --video /path/to/demo.mp4 --output 李上一.zip
+```
+
+成功后 ZIP 内部只能有 `README.txt` 和 `李上一.mp4`。脚本不会创建占位视频；没有 `ffprobe` 时必须显式使用 `--skip-duration-check`，且不能把该离线例外当成最终验收。
+
 `--planning` 是一个显式 opt-in 的 `update_plan` 工具。它只保存 1--8 步的内存快照，用于观察模型意图；计划全部标记为 `completed` 也不会自动终止 Runtime，更不能证明代码正确。默认仍只暴露六个 MVP 工具。
 
 ## Harbor 外部适配
 
 核心包不依赖 Harbor。`coding_agent.harbor_adapter` 提供一个可选异步桥接：同步 `AgentRuntime` 在工作线程运行，`RemoteExecutionBackend` 将六个工具的操作通过异步环境接口发送到任务容器的 `/app` 工作区，模型请求仍在主机侧完成。适配器不向容器传递 API key，并可把 ATIF-v1.7 `trajectory.json` 和运行摘要原子写入 Harbor 日志目录。
 
-这是外部评测适配层，不是本地强隔离实现；需要 Harbor/Docker 的环境由评测方提供。当前主机没有安装这些依赖，因此默认测试不会启动容器。
+Harbor 0.22 的官方入口是 `coding_agent.harbor_plugin:CourseCodingAgent`。它只在安装可选依赖后加载，安装方式为：
+
+```bash
+python3 -m pip install -e ".[harbor]"
+```
+
+核心运行时支持 Python 3.11+；Harbor 0.22 本身要求 Python 3.12+，因此 Harbor 入口应在 Python 3.12 或更高版本的环境中安装和执行。
+
+插件实现 Harbor `BaseAgent` 的 `name`、`version`、`setup` 和 `run` 接口。模型请求使用宿主进程中的 `CODING_AGENT_MODEL`、`CODING_AGENT_PROVIDER`、`CODING_AGENT_BASE_URL` 和命名 key 变量（GLM 默认 `ZAI_API_KEY`）；`model_name` 参数优先且按原样发送，不猜测别名。容器只接收经过路径/参数校验的六个工具调用。运行结束后，`AgentContext.metadata` 保存脱敏终态、最终回答和统计，日志目录保存 `trajectory.json`、`run.json` 与脱敏事件流。
+
+一个单任务冒烟命令（需已安装并运行 Docker、准备好 Harbor 数据集）如下：
+
+```bash
+export ZAI_API_KEY="<只在当前 shell 设置>"
+export CODING_AGENT_MODEL="<控制台原样的 GLM model ID>"
+harbor trial start \
+  --agent coding_agent.harbor_plugin:CourseCodingAgent \
+  --model "$CODING_AGENT_MODEL" \
+  --path datasets/terminal-bench-2.1/fix-code-vulnerability
+```
+
+密钥只通过环境变量提供；不要把 `--agent-env KEY=VALUE`、命令输出或 Harbor 日志提交到 Git。
+
+这是外部评测适配层，不是本地强隔离实现；Harbor/Docker 只在执行外部评测时需要，核心安装和默认测试不会启动容器。本仓库的实验脚本会把任务数据集、并发度、重试次数和两组 Agent 的命令固定下来，结果应标注为八任务、三次重复的探索性实验，而不是官方 leaderboard 成绩。
 
 ## 有界 Benchmark
 
@@ -223,7 +256,17 @@ coding-agent-benchmark --manifest benchmarks/example.json --dry-run
 coding-agent-benchmark --manifest benchmarks/example.json --execute --output result.json
 ```
 
-它可以比较同一模型驱动的不同 Agent，但不是官方 leaderboard 成绩。Terminal-Bench 2.1 的后置实验只计划选取 8 个 coding-oriented 任务、每任务单次运行；公开套件共有 89 个任务，官方口径通常要求每任务至少 5 次，二者不能混称。
+它可以比较同一模型驱动的不同 Agent，但不是官方 leaderboard 成绩。Terminal-Bench 2.1 的后置实验固定为 3 个模型、2 个 Agent、8 个任务、每任务 3 次（144 个 trial）；公开套件共有 89 个任务，二者不能混称。实验脚本还提供两个失败任务的 20/20-efficient/30 轮消融，以及正式运行前的 `fix-code-vulnerability` 六组合冒烟测试。
+
+正式执行顺序固定为：先完成两个失败任务的 `--ablation --execute`，再执行
+`--smoke --execute`，最后把消融报告通过 `--ablation-report`、把六组合
+冒烟报告通过 `--smoke-report` 传给 `--formal --execute`。formal 会在启动
+任何 Harbor job 前拒绝缺失、未完成或 setup/config/infrastructure 失败的
+冒烟报告，也会拒绝缺失或未完成的消融报告；`--allow-incomplete` 仅用于
+离线计划和部分产物生成，不能放宽可执行 formal 门禁。verifier failure 会保留并单独统计。完整命令、派生镜像准备和报告归档说明见
+[`benchmarks/README.md`](benchmarks/README.md)。仓库中的
+[`reports/terminal-bench-performance.md`](reports/terminal-bench-performance.md)
+是此前完成的脱敏 144-trial 结果快照；原始 Harbor 日志和本机数据集不随仓库提交。默认测试和计划生成均为离线操作。
 
 需要让外部 Agent 使用模型服务时，不要把 key 写进 manifest。可以在该 Agent 项中写
 `"environment_from_host": ["DEEPSEEK_API_KEY"]`，运行时只按这个明确的变量名从当前进程读取值；报告只记录变量名，命令输出仍会脱敏。未列出的敏感宿主变量不会传入子进程。

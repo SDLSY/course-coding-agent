@@ -1,0 +1,158 @@
+<section id="tb-performance-visual" class="tb-visual" aria-labelledby="tb-title">
+  <style>
+    #tb-performance-visual { --background: light-dark(#ffffff, #181818); --foreground: light-dark(#17202a, #edf2f7); --muted: light-dark(#5c6770, #a9b4bf); --border: light-dark(#d7dee5, #3b4650); --viz-series-1: #0f766e; --viz-series-2: #c2410c; --viz-series-3: #1d4ed8; color: var(--foreground); background: transparent; font-family: Arial, "Noto Sans CJK SC", sans-serif; color-scheme: light dark; }
+    #tb-performance-visual h1 { margin: 0 0 .25rem; font-size: 1.25rem; line-height: 1.35; font-weight: 500; }
+    #tb-performance-visual .tb-subtitle, #tb-performance-visual .tb-note { margin: 0; color: var(--muted); font-size: .82rem; line-height: 1.45; }
+    #tb-performance-visual .tb-legend { display: flex; flex-wrap: wrap; gap: .35rem 1.1rem; margin: .75rem 0 .35rem; font-size: .78rem; color: var(--muted); }
+    #tb-performance-visual .tb-legend-item { display: inline-flex; align-items: center; gap: .35rem; white-space: nowrap; }
+    #tb-performance-visual .tb-swatch { width: .72rem; height: .72rem; display: inline-block; background: var(--swatch); }
+    #tb-performance-visual .tb-agent-line { width: 1.3rem; display: inline-block; border-top: 2px solid var(--foreground); }
+    #tb-performance-visual .tb-agent-line.dashed { border-top-style: dashed; opacity: .68; }
+    #tb-performance-visual .tb-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.2rem 1.6rem; }
+    #tb-performance-visual figure { margin: 0; min-width: 0; }
+    #tb-performance-visual figcaption { font-size: .9rem; font-weight: 500; margin: .3rem 0; }
+    #tb-performance-visual svg { display: block; width: 100%; height: auto; overflow: visible; color: var(--foreground); }
+    #tb-performance-visual svg text { fill: currentColor; font-family: inherit; font-size: 12px; }
+    #tb-performance-visual svg .panel-title { font-size: 15px; font-weight: 500; }
+    #tb-performance-visual svg .tick, #tb-performance-visual svg .secondary { fill: var(--muted); font-size: 11px; }
+    #tb-performance-visual svg .row-label { font-size: 11px; }
+    #tb-performance-visual svg .value { font-size: 11px; font-weight: 500; }
+    #tb-performance-visual svg .grid { stroke: var(--border); stroke-width: 1; }
+    #tb-performance-visual svg .axis { stroke: currentColor; stroke-width: 1.1; }
+    #tb-performance-visual svg .interval { stroke: currentColor; stroke-width: 1.4; }
+    #tb-performance-visual svg .tools-bar { fill: var(--muted); opacity: .55; }
+    #tb-performance-visual svg .series-1 { fill: var(--viz-series-1); }
+    #tb-performance-visual svg .series-2 { fill: var(--viz-series-2); }
+    #tb-performance-visual svg .series-3 { fill: var(--viz-series-3); }
+    #tb-performance-visual .tb-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 780px) { #tb-performance-visual .tb-grid { grid-template-columns: 1fr; gap: 1rem; } }
+  </style>
+  <h1 id="tb-title">Coding agent 性能对比</h1>
+  <p class="tb-subtitle">8 个 Terminal-Bench 2.1 任务，每项 3 次；通过率含 Wilson 95% 区间，耗时和 token 为中位数。</p>
+  <div class="tb-legend" aria-label="图例">
+    <span class="tb-legend-item"><i class="tb-swatch" style="--swatch:var(--viz-series-1)"></i>DeepSeek V4 Flash Vision</span>
+    <span class="tb-legend-item"><i class="tb-swatch" style="--swatch:var(--viz-series-2)"></i>GLM-5.3 Flash</span>
+    <span class="tb-legend-item"><i class="tb-swatch" style="--swatch:var(--viz-series-3)"></i>GPT-5.6 Sol</span>
+    <span class="tb-legend-item"><i class="tb-agent-line"></i>CourseCodingAgent</span>
+    <span class="tb-legend-item"><i class="tb-agent-line dashed"></i>OpenCode 1.18.25</span>
+  </div>
+  <div class="tb-grid">
+    <figure><svg data-metric="accuracy" role="img" aria-label="各组合正确率及 Wilson 95% 区间"></svg></figure>
+    <figure><svg data-metric="time" role="img" aria-label="各组合总耗时中位数及 IQR"></svg></figure>
+    <figure><svg data-metric="tokens" role="img" aria-label="各组合总 token 中位数及 IQR"></svg></figure>
+    <figure><svg data-metric="calls" role="img" aria-label="各组合模型请求和工具调用中位数"></svg></figure>
+  </div>
+  <p class="tb-note">线段表示 IQR；调用面板中的两个数字依次为模型请求 / 工具调用。GPT-5.6 Sol 的 Course agent 未返回 cache token。</p>
+  <table class="tb-sr-only"><caption>完整组合汇总</caption><thead><tr><th>模型/Agent</th><th>通过率</th><th>总耗时中位数</th><th>总 token 中位数</th></tr></thead><tbody id="tb-accessible-rows"></tbody></table>
+  <script>
+    (() => {
+      const data = {"groups":[{"id":"deepseek-v4-flash-vision-exp::course-coding-agent","model":"deepseek-v4-flash-vision-exp","model_short":"DeepSeek","model_display":"DeepSeek V4 Flash Vision","agent":"course-coding-agent","agent_short":"Course","agent_display":"CourseCodingAgent","label":"DeepSeek / Course","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":16,"n_failed":8,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.6666666666666666,"accuracy_low":0.4670631683813174,"accuracy_high":0.8202780967270225,"agent_elapsed_seconds":360.93,"agent_elapsed_q1":150.507,"agent_elapsed_q3":439.564,"total_elapsed_seconds":504.755,"total_elapsed_q1":295.678,"total_elapsed_q3":643.78,"input_tokens":495909.0,"output_tokens":23782.0,"cache_tokens":408320.0,"total_tokens":525559.0,"total_tokens_q1":265961.5,"total_tokens_q3":614089.0,"model_requests":30.0,"tool_calls":29.0,"infrastructure_failures":0},{"id":"deepseek-v4-flash-vision-exp::opencode-pinned","model":"deepseek-v4-flash-vision-exp","model_short":"DeepSeek","model_display":"DeepSeek V4 Flash Vision","agent":"opencode-pinned","agent_short":"OpenCode","agent_display":"OpenCode 1.18.25","label":"DeepSeek / OpenCode","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":14,"n_failed":10,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.5833333333333334,"accuracy_low":0.3883466586522876,"accuracy_high":0.7553239739018824,"agent_elapsed_seconds":242.557,"agent_elapsed_q1":45.261,"agent_elapsed_q3":696.743,"total_elapsed_seconds":471.922,"total_elapsed_q1":268.073,"total_elapsed_q3":946.965,"input_tokens":168803.0,"output_tokens":2494.0,"cache_tokens":158592.0,"total_tokens":171072.5,"total_tokens_q1":87289.0,"total_tokens_q3":273177.5,"model_requests":15.5,"tool_calls":15.5,"infrastructure_failures":0},{"id":"glm-5.3-flash::course-coding-agent","model":"glm-5.3-flash","model_short":"GLM-5.3","model_display":"GLM-5.3 Flash","agent":"course-coding-agent","agent_short":"Course","agent_display":"CourseCodingAgent","label":"GLM-5.3 / Course","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":17,"n_failed":7,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.7083333333333334,"accuracy_low":0.5083230633550337,"accuracy_high":0.8508535180303913,"agent_elapsed_seconds":285.432,"agent_elapsed_q1":133.044,"agent_elapsed_q3":419.482,"total_elapsed_seconds":346.517,"total_elapsed_q1":153.728,"total_elapsed_q3":517.941,"input_tokens":56070.0,"output_tokens":3114.0,"cache_tokens":31360.0,"total_tokens":60216.0,"total_tokens_q1":29091.0,"total_tokens_q3":86597.0,"model_requests":12.0,"tool_calls":13.0,"infrastructure_failures":0},{"id":"glm-5.3-flash::opencode-pinned","model":"glm-5.3-flash","model_short":"GLM-5.3","model_display":"GLM-5.3 Flash","agent":"opencode-pinned","agent_short":"OpenCode","agent_display":"OpenCode 1.18.25","label":"GLM-5.3 / OpenCode","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":15,"n_failed":9,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.625,"accuracy_low":0.42709962442674276,"accuracy_high":0.7884063244045122,"agent_elapsed_seconds":710.383,"agent_elapsed_q1":136.134,"agent_elapsed_q3":900.028,"total_elapsed_seconds":760.681,"total_elapsed_q1":224.608,"total_elapsed_q3":974.372,"input_tokens":156387.0,"output_tokens":1670.0,"cache_tokens":124480.0,"total_tokens":158384.0,"total_tokens_q1":80124.5,"total_tokens_q3":294658.0,"model_requests":10.0,"tool_calls":13.0,"infrastructure_failures":0},{"id":"gpt-5.6-sol::course-coding-agent","model":"gpt-5.6-sol","model_short":"GPT-5.6","model_display":"GPT-5.6 Sol","agent":"course-coding-agent","agent_short":"Course","agent_display":"CourseCodingAgent","label":"GPT-5.6 / Course","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":21,"n_failed":3,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.875,"accuracy_low":0.6899611872949993,"accuracy_high":0.9565566591987655,"agent_elapsed_seconds":206.068,"agent_elapsed_q1":123.812,"agent_elapsed_q3":391.733,"total_elapsed_seconds":257.166,"total_elapsed_q1":151.73,"total_elapsed_q3":434.14,"input_tokens":60758.0,"output_tokens":5249.0,"cache_tokens":null,"total_tokens":72607.0,"total_tokens_q1":28432.0,"total_tokens_q3":155932.0,"model_requests":10.0,"tool_calls":17.0,"infrastructure_failures":0},{"id":"gpt-5.6-sol::opencode-pinned","model":"gpt-5.6-sol","model_short":"GPT-5.6","model_display":"GPT-5.6 Sol","agent":"opencode-pinned","agent_short":"OpenCode","agent_display":"OpenCode 1.18.25","label":"GPT-5.6 / OpenCode","expected_trials":24,"n_trials":24,"n_evaluable_trials":24,"n_passed":21,"n_failed":3,"n_setup_failures":0,"n_unresolved":0,"accuracy":0.875,"accuracy_low":0.6899611872949993,"accuracy_high":0.9565566591987655,"agent_elapsed_seconds":147.024,"agent_elapsed_q1":102.93,"agent_elapsed_q3":453.766,"total_elapsed_seconds":263.529,"total_elapsed_q1":212.236,"total_elapsed_q3":604.722,"input_tokens":190232.0,"output_tokens":2383.5,"cache_tokens":165888.0,"total_tokens":192068.5,"total_tokens_q1":167744.2,"total_tokens_q3":529751.5,"model_requests":13.0,"tool_calls":21.0,"infrastructure_failures":0}]};
+      const root = document.getElementById("tb-performance-visual");
+      if (!root) return;
+      const ns = "http://www.w3.org/2000/svg";
+      const modelColors = ["var(--viz-series-1)", "var(--viz-series-2)", "var(--viz-series-3)"];
+      const modelIndex = {"deepseek-v4-flash-vision-exp": 0, "glm-5.3-flash": 1, "gpt-5.6-sol": 2};
+      const shortModel = {"deepseek-v4-flash-vision-exp": "DeepSeek", "glm-5.3-flash": "GLM-5.3", "gpt-5.6-sol": "GPT-5.6"};
+      const shortAgent = {"course-coding-agent": "Course", "opencode-pinned": "OpenCode"};
+      const groups = data.groups;
+      const make = (tag, attrs = {}, content = "") => {
+        const node = document.createElementNS(ns, tag);
+        Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        if (content) node.textContent = content;
+        return node;
+      };
+      const formatSeconds = value => value == null ? "n/a" : (value >= 100 ? `${value.toFixed(0)} s` : `${value.toFixed(1)} s`);
+      const formatTokens = value => value == null ? "n/a" : (value >= 1000000 ? `${(value / 1000000).toFixed(2)}M` : `${(value / 1000).toFixed(1)}k`);
+      const niceMax = (value, step) => Math.max(step, Math.ceil(value / step) * step);
+      const addText = (svg, x, y, text, cls = "", anchor = "start") => svg.appendChild(make("text", {x, y, "text-anchor": anchor, class: cls}, text));
+      const scale = (value, max, x0, x1) => x0 + Math.max(0, Math.min(max, value || 0)) / max * (x1 - x0);
+      const drawPanel = (svg, metric) => {
+        const width = Math.max(320, svg.parentElement.getBoundingClientRect().width || 600);
+        const narrow = width < 480;
+        const height = narrow ? 430 : 350;
+        const left = narrow ? 122 : 148;
+        // Reserve a right-aligned value column for every metric.
+        const right = narrow ? 102 : 112;
+        const valueX = width - 6;
+        const top = 42;
+        const bottom = 52;
+        const x0 = left;
+        const x1 = width - right;
+        const plotTop = top;
+        const plotBottom = height - bottom;
+        const rowHeight = (plotBottom - plotTop) / groups.length;
+        let title, axis, domain, ticks;
+        if (metric === "accuracy") { title = "正确率"; axis = "通过率 (%)"; domain = 100; ticks = [0, 25, 50, 75, 100]; }
+        else if (metric === "time") { title = "总耗时"; axis = "总耗时 (seconds; median, IQR)"; domain = niceMax(Math.max(...groups.map(g => g.total_elapsed_q3 || 0)), 100); ticks = Array.from({length: 6}, (_, i) => domain * i / 5); }
+        else if (metric === "tokens") { title = "总 token"; axis = "总 token (median, IQR)"; domain = niceMax(Math.max(...groups.map(g => g.total_tokens_q3 || 0)), 100000); ticks = Array.from({length: 6}, (_, i) => domain * i / 5); }
+        else { title = "模型与工具调用"; axis = "次数 (median; requests / tools)"; domain = niceMax(Math.max(...groups.map(g => Math.max(g.model_requests || 0, g.tool_calls || 0))) * 1.15, 5); ticks = Array.from({length: 6}, (_, i) => domain * i / 5); }
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+        svg.setAttribute("height", height);
+        const titleNode = make("title", {}, title);
+        svg.appendChild(titleNode);
+        addText(svg, left, 22, title, "panel-title");
+        ticks.forEach(tick => {
+          const tx = scale(tick, domain, x0, x1);
+          svg.appendChild(make("line", {class: "grid", x1: tx, y1: plotTop, x2: tx, y2: plotBottom}));
+          const label = metric === "tokens" ? (domain < 1000000 ? `${(tick / 1000).toFixed(0)}k` : `${(tick / 1000000).toFixed(1)}M`) : tick.toFixed(0);
+          addText(svg, tx, plotBottom + 17, label, "tick", "middle");
+        });
+        groups.forEach((group, index) => {
+          const cy = plotTop + rowHeight * (index + .5);
+          const color = modelColors[modelIndex[group.model]];
+          const opacity = group.agent === "opencode-pinned" ? .68 : 1;
+          const modelLabel = shortModel[group.model];
+          addText(svg, left - 8, cy - 2, modelLabel, "row-label", "end");
+          addText(svg, left - 8, cy + 12, shortAgent[group.agent], "row-label secondary", "end");
+          if (metric === "accuracy") {
+            const x = scale((group.accuracy || 0) * 100, domain, x0, x1);
+            const low = scale((group.accuracy_low || 0) * 100, domain, x0, x1);
+            const high = scale((group.accuracy_high || 0) * 100, domain, x0, x1);
+            svg.appendChild(make("rect", {class: `series-${modelIndex[group.model] + 1}`, x: x0, y: cy - 10, width: x - x0, height: 20, opacity}));
+            svg.appendChild(make("line", {class: "interval", x1: low, y1: cy, x2: high, y2: cy}));
+            svg.appendChild(make("line", {class: "interval", x1: low, y1: cy - 7, x2: low, y2: cy + 7}));
+            svg.appendChild(make("line", {class: "interval", x1: high, y1: cy - 7, x2: high, y2: cy + 7}));
+            svg.appendChild(make("circle", {class: `series-${modelIndex[group.model] + 1}`, cx: x, cy, r: 4}));
+            const label = `${((group.accuracy || 0) * 100).toFixed(1)}% (${group.n_passed}/${group.n_evaluable_trials})`;
+            addText(svg, valueX, cy + 4, label, "value", "end");
+          } else if (metric === "time" || metric === "tokens") {
+            const median = metric === "time" ? group.total_elapsed_seconds : group.total_tokens;
+            const q1 = metric === "time" ? group.total_elapsed_q1 : group.total_tokens_q1;
+            const q3 = metric === "time" ? group.total_elapsed_q3 : group.total_tokens_q3;
+            const x = scale(median, domain, x0, x1);
+            const lo = scale(q1, domain, x0, x1);
+            const hi = scale(q3, domain, x0, x1);
+            svg.appendChild(make("rect", {class: `series-${modelIndex[group.model] + 1}`, x: x0, y: cy - 9, width: x - x0, height: 18, opacity}));
+            svg.appendChild(make("line", {class: "interval", x1: lo, y1: cy, x2: hi, y2: cy}));
+            svg.appendChild(make("circle", {class: `series-${modelIndex[group.model] + 1}`, cx: x, cy, r: 4}));
+            const label = metric === "time" ? formatSeconds(median) : formatTokens(median);
+            addText(svg, valueX, cy + 4, label, "value", "end");
+          } else {
+            const req = scale(group.model_requests, domain, x0, x1);
+            const tool = scale(group.tool_calls, domain, x0, x1);
+            svg.appendChild(make("rect", {class: `series-${modelIndex[group.model] + 1}`, x: x0, y: cy - 12, width: req - x0, height: 9, opacity}));
+            svg.appendChild(make("rect", {class: "tools-bar", x: x0, y: cy + 3, width: tool - x0, height: 9}));
+            addText(svg, valueX, cy + 4, `${group.model_requests} / ${group.tool_calls}`, "value", "end");
+          }
+        });
+        svg.appendChild(make("line", {class: "axis", x1: x0, y1: plotBottom, x2: x1, y2: plotBottom}));
+        const xAxis = make("text", {class: "axis-title", "data-axis": "x", x: (x0 + x1) / 2, y: height - 8, "text-anchor": "middle"}, axis);
+        svg.appendChild(xAxis);
+        const yMid = (plotTop + plotBottom) / 2;
+        const yLabel = make("text", {class: "axis-title", "data-axis": "y", x: 12, y: yMid, transform: `rotate(-90 12 ${yMid})`}, "模型 / Agent");
+        svg.appendChild(yLabel);
+      };
+      const drawAll = () => root.querySelectorAll("svg[data-metric]").forEach(svg => drawPanel(svg, svg.dataset.metric));
+      const tableBody = document.getElementById("tb-accessible-rows");
+      if (tableBody) groups.forEach(group => {
+        const row = document.createElement("tr");
+        [ `${group.model_display} / ${group.agent_display}`, `${(group.accuracy * 100).toFixed(1)}%`, formatSeconds(group.total_elapsed_seconds), formatTokens(group.total_tokens) ].forEach(value => { const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell); });
+        tableBody.appendChild(row);
+      });
+      drawAll();
+      if (typeof ResizeObserver !== "undefined") new ResizeObserver(drawAll).observe(root);
+      else window.addEventListener("resize", drawAll);
+    })();
+  </script>
+</section>
