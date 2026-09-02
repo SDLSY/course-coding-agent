@@ -6,6 +6,6 @@ Git仓库地址：https://github.com/SDLSY/course-coding-agent
 
 特色功能：保持 tool call/result 严格配对，按完整事务块裁剪上下文；模型、协议和超时有界恢复；文件路径防越界；命令限时、限输出并过滤密钥；终端和 JSONL trace 脱敏。`--verify` 可独立验收，`--planning` 可记录计划，benchmark 输出统一 JSON。`COMPLETED` 不等于代码已正确。
 
-Harbor 入口为 `coding_agent.harbor_plugin:CourseCodingAgent`（需 Python 3.12+ 和 Harbor 0.22）；Runtime 在主机运行，六个工具转发到容器 `/app`，日志输出脱敏 ATIF。核心不依赖 Harbor/Docker，也不是强沙箱。
+Harbor 入口为 `coding_agent.harbor_plugin:CourseCodingAgent`（需 Python 3.12+ 和 Harbor 0.22；安装：`python3 -m pip install -e ".[harbor]"`）；Runtime 在主机运行，六个工具转发到容器 `/app`，日志输出脱敏 ATIF。核心不依赖 Harbor/Docker，也不是强沙箱。
 
 测试：`python3 -m pytest`；静态检查：`python3 -m ruff check src tests`。
